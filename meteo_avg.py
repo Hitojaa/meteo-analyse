@@ -104,6 +104,8 @@ def _report_to_dict(report: ForecastReport) -> dict[str, Any]:
         "aggregated": {
             "tmin_c": report.aggregated.tmin_c,
             "tmax_c": report.aggregated.tmax_c,
+            "tmin_f": _c_to_f(report.aggregated.tmin_c),
+            "tmax_f": _c_to_f(report.aggregated.tmax_c),
             "tmin_range": list(report.aggregated.tmin_range),
             "tmax_range": list(report.aggregated.tmax_range),
             "sources_used": report.aggregated.sources_used,
@@ -114,6 +116,8 @@ def _report_to_dict(report: ForecastReport) -> dict[str, Any]:
                 "provider_name": p.provider_name,
                 "tmin_c": p.tmin_c,
                 "tmax_c": p.tmax_c,
+                "tmin_f": _c_to_f(p.tmin_c) if p.tmin_c is not None else None,
+                "tmax_f": _c_to_f(p.tmax_c) if p.tmax_c is not None else None,
                 "date": p.date,
                 "timezone": p.timezone,
                 "quality": p.quality.value,
@@ -127,30 +131,38 @@ def _report_to_dict(report: ForecastReport) -> dict[str, Any]:
     }
 
 
+def _c_to_f(c: float) -> float:
+    return round(c * 9 / 5 + 32, 1)
+
+
 def _print_table(report: ForecastReport) -> None:
     loc = report.location
     agg = report.aggregated
 
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 72}")
     print(f"  Location : {loc.display_name}")
     print(f"  Date     : {report.date}")
     print(f"  Timezone : {report.timezone}")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 72}")
 
     if agg.warning:
         print(f"  ⚠  {agg.warning}")
 
-    print(f"\n  Aggregated forecast (°C):")
-    print(f"    Tmin : {agg.tmin_c:>6.1f} °C   (range: {agg.tmin_range[0]:.1f} – {agg.tmin_range[1]:.1f})")
-    print(f"    Tmax : {agg.tmax_c:>6.1f} °C   (range: {agg.tmax_range[0]:.1f} – {agg.tmax_range[1]:.1f})")
+    print(f"\n  Aggregated forecast:")
+    print(f"    Tmin : {agg.tmin_c:>6.1f} °C / {_c_to_f(agg.tmin_c):>6.1f} °F   (range: {agg.tmin_range[0]:.1f} – {agg.tmin_range[1]:.1f} °C)")
+    print(f"    Tmax : {agg.tmax_c:>6.1f} °C / {_c_to_f(agg.tmax_c):>6.1f} °F   (range: {agg.tmax_range[0]:.1f} – {agg.tmax_range[1]:.1f} °C)")
     print(f"    Sources used: {agg.sources_used}")
 
-    print(f"\n  {'Provider':<20} {'Tmin (°C)':>10} {'Tmax (°C)':>10} {'Quality':<22}")
-    print(f"  {'-' * 62}")
+    print(f"\n  {'Provider':<20} {'Tmin':>14} {'Tmax':>14} {'Quality':<22}")
+    print(f"  {'-' * 70}")
     for p in report.per_provider:
-        tmin_s = f"{p.tmin_c:.1f}" if p.tmin_c is not None else "N/A"
-        tmax_s = f"{p.tmax_c:.1f}" if p.tmax_c is not None else "N/A"
-        print(f"  {p.provider_name:<20} {tmin_s:>10} {tmax_s:>10} {p.quality.value:<22}")
+        if p.tmin_c is not None and p.tmax_c is not None:
+            tmin_s = f"{p.tmin_c:.1f}°C/{_c_to_f(p.tmin_c):.1f}°F"
+            tmax_s = f"{p.tmax_c:.1f}°C/{_c_to_f(p.tmax_c):.1f}°F"
+        else:
+            tmin_s = "N/A"
+            tmax_s = "N/A"
+        print(f"  {p.provider_name:<20} {tmin_s:>14} {tmax_s:>14} {p.quality.value:<22}")
 
     if report.errors:
         print(f"\n  Errors:")
