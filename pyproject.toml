@@ -1,0 +1,17 @@
+[project]
+name = "meteo-avg"
+version = "1.0.0"
+description = "Aggregate weather forecasts from multiple providers"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27,<1",
+    "timezonefinder>=6.2,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+meteo-avg = "meteo_avg:main"
