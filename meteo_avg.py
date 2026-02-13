@@ -30,8 +30,8 @@ from models import (
 )
 from providers import open_meteo, openweather, weatherapi
 
-PROVIDERS = [
-    ("Open-Meteo", open_meteo.fetch),
+# Providers that return a single ProviderResult
+SINGLE_PROVIDERS = [
     ("WeatherAPI", weatherapi.fetch),
     ("OpenWeatherMap", openweather.fetch),
 ]
@@ -53,7 +53,15 @@ def _fetch_all(
     results: list[ProviderResult] = []
     errors: list[ProviderError] = []
 
-    for name, fetch_fn in PROVIDERS:
+    # Open-Meteo multi-model (returns a list of results)
+    try:
+        results.extend(open_meteo.fetch(loc.lat, loc.lon, date, loc.timezone))
+    except Exception as exc:
+        log.warning("Open-Meteo: %s", exc)
+        errors.append(ProviderError(provider_name="Open-Meteo", error=str(exc)))
+
+    # Single-result providers (WeatherAPI, OpenWeatherMap)
+    for name, fetch_fn in SINGLE_PROVIDERS:
         try:
             result = fetch_fn(loc.lat, loc.lon, date, loc.timezone)
             results.append(result)

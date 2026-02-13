@@ -8,18 +8,25 @@ from models import DataQuality
 
 
 class TestOpenMeteo:
-    """Test Open-Meteo provider with mocked responses."""
+    """Test Open-Meteo multi-model provider with mocked responses."""
 
     SAMPLE_RESPONSE = {
         "daily": {
             "time": ["2025-06-15"],
+            # best_match (no suffix)
             "temperature_2m_max": [24.3],
             "temperature_2m_min": [12.1],
+            # ecmwf model
+            "temperature_2m_max_ecmwf_ifs025": [23.8],
+            "temperature_2m_min_ecmwf_ifs025": [11.5],
+            # gfs model
+            "temperature_2m_max_gfs_seamless": [25.0],
+            "temperature_2m_min_gfs_seamless": [12.8],
         }
     }
 
     @patch("providers.open_meteo.httpx.Client")
-    def test_parse_response(self, mock_client_cls):
+    def test_parse_multi_model(self, mock_client_cls):
         mock_resp = MagicMock()
         mock_resp.json.return_value = self.SAMPLE_RESPONSE
         mock_resp.raise_for_status = MagicMock()
@@ -31,12 +38,46 @@ class TestOpenMeteo:
 
         from providers.open_meteo import fetch
 
-        result = fetch(48.85, 2.35, "2025-06-15", "Europe/Paris")
+        results = fetch(48.85, 2.35, "2025-06-15", "Europe/Paris")
 
-        assert result.provider_name == "Open-Meteo"
-        assert result.tmin_c == 12.1
-        assert result.tmax_c == 24.3
-        assert result.quality == DataQuality.DAILY_DIRECT
+        assert isinstance(results, list)
+        assert len(results) >= 3  # best_match + ecmwf + gfs at minimum
+
+        names = {r.provider_name for r in results}
+        assert "Open-Meteo (Best Match)" in names
+        assert "ECMWF IFS 0.25°" in names
+        assert "NOAA GFS" in names
+
+        best = next(r for r in results if r.provider_name == "Open-Meteo (Best Match)")
+        assert best.tmin_c == 12.1
+        assert best.tmax_c == 24.3
+        assert best.quality == DataQuality.DAILY_DIRECT
+
+    @patch("providers.open_meteo.httpx.Client")
+    def test_skips_models_without_data(self, mock_client_cls):
+        """Models not present in response should be silently skipped."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "daily": {
+                "time": ["2025-06-15"],
+                "temperature_2m_max": [24.3],
+                "temperature_2m_min": [12.1],
+            }
+        }
+        mock_resp.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_resp
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_client
+
+        from providers.open_meteo import fetch
+
+        results = fetch(48.85, 2.35, "2025-06-15", "Europe/Paris")
+
+        # Only best_match has data
+        assert len(results) == 1
+        assert results[0].provider_name == "Open-Meteo (Best Match)"
 
 
 class TestWeatherAPI:
