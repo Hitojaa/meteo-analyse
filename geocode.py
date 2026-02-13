@@ -1,24 +1,44 @@
-"""Geocoding with Nominatim (primary) and Open-Meteo (fallback)."""
+"""Geocoding with Nominatim (primary) and Open-Meteo (fallback).
+
+No native C dependencies – timezone resolution uses the Open-Meteo
+geocoding API (which returns IANA timezone) instead of timezonefinder.
+"""
 
 from __future__ import annotations
 
 import logging
 
 import httpx
-from timezonefinder import TimezoneFinder
 
 from models import GeoLocation
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OPEN_METEO_GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 USER_AGENT = "meteo_avg/1.0 (https://github.com/meteo-avg; weather aggregation CLI)"
-_tf = TimezoneFinder()
 log = logging.getLogger(__name__)
 
 
 def _resolve_timezone(lat: float, lon: float) -> str:
-    tz = _tf.timezone_at(lat=lat, lng=lon)
-    return tz if tz else "UTC"
+    """Resolve timezone from coordinates via Open-Meteo forecast endpoint.
+
+    The Open-Meteo forecast API accepts a timezone=auto parameter and
+    returns the resolved IANA timezone in the response, without needing
+    any local C library.
+    """
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_max",
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            resp.raise_for_status()
+        return resp.json().get("timezone", "UTC")
+    except Exception:
+        return "UTC"
 
 
 def _geocode_nominatim(city: str) -> GeoLocation:
@@ -56,7 +76,10 @@ def _geocode_nominatim(city: str) -> GeoLocation:
 
 
 def _geocode_open_meteo(city: str) -> GeoLocation:
-    """Fallback: Open-Meteo geocoding API (no key, no strict User-Agent)."""
+    """Fallback: Open-Meteo geocoding API (no key, no strict User-Agent).
+
+    This endpoint already returns the IANA timezone directly.
+    """
     params = {"name": city, "count": 5, "language": "en", "format": "json"}
 
     with httpx.Client(timeout=10) as client:
@@ -71,7 +94,7 @@ def _geocode_open_meteo(city: str) -> GeoLocation:
     best = results[0]
     lat = best["latitude"]
     lon = best["longitude"]
-    tz = best.get("timezone", _resolve_timezone(lat, lon))
+    tz = best.get("timezone", "UTC")
 
     country = best.get("country", "")
     admin1 = best.get("admin1", "")
