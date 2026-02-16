@@ -16,9 +16,8 @@ from models import DataQuality, ProviderResult
 BASE_URL = "https://api.open-meteo.com/v1/forecast"
 log = logging.getLogger(__name__)
 
-# Available models on Open-Meteo with human-readable labels.
-# These mirror what Windy shows (ECMWF, GFS, ICON, Météo-France, etc.)
-MODELS: dict[str, str] = {
+# Core models (well-tested, guaranteed by Open-Meteo)
+CORE_MODELS: dict[str, str] = {
     "best_match": "Open-Meteo (Best Match)",
     "ecmwf_ifs025": "ECMWF IFS 0.25°",
     "gfs_seamless": "NOAA GFS",
@@ -28,18 +27,26 @@ MODELS: dict[str, str] = {
     "jma_seamless": "JMA (Japan)",
     "ukmo_seamless": "UK Met Office",
     "metno_seamless": "MET Norway",
-    "knmi_seamless": "KNMI (Netherlands)",
-    "dmi_seamless": "DMI (Denmark)",
-    "arpae_cosmo_seamless": "ARPAE COSMO (Italy)",
 }
 
+# Extra regional models (may not be available for all locations)
+EXTRA_MODELS: dict[str, str] = {
+    "knmi_seamless": "KNMI (Netherlands)",
+    "dmi_seamless": "DMI (Denmark)",
+}
 
-def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResult]:
-    """Fetch daily min/max from Open-Meteo for all available NWP models.
+MODELS: dict[str, str] = {**CORE_MODELS, **EXTRA_MODELS}
 
-    Returns one ProviderResult per model.
-    """
-    model_keys = list(MODELS.keys())
+
+def _query_models(
+    client: httpx.Client,
+    models: dict[str, str],
+    lat: float,
+    lon: float,
+    date: str,
+    timezone: str,
+) -> dict:
+    """Query Open-Meteo with given models, return the daily dict."""
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -47,18 +54,37 @@ def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResu
         "timezone": timezone,
         "start_date": date,
         "end_date": date,
-        "models": ",".join(model_keys),
+        "models": ",".join(models.keys()),
     }
+    resp = client.get(BASE_URL, params=params)
+    resp.raise_for_status()
+    return resp.json().get("daily", {})
 
+
+def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResult]:
+    """Fetch daily min/max from Open-Meteo for all available NWP models.
+
+    Tries all models first; if the API rejects the request (e.g. an
+    unsupported model name), falls back to core models only.
+
+    Returns one ProviderResult per model.
+    """
     with httpx.Client(timeout=15) as client:
-        resp = client.get(BASE_URL, params=params)
-        resp.raise_for_status()
-
-    data = resp.json()
-    daily = data.get("daily", {})
+        try:
+            daily = _query_models(client, MODELS, lat, lon, date, timezone)
+            active_models = MODELS
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400:
+                log.warning(
+                    "Open-Meteo rejected full model list, retrying with core models only"
+                )
+                daily = _query_models(client, CORE_MODELS, lat, lon, date, timezone)
+                active_models = CORE_MODELS
+            else:
+                raise
 
     results: list[ProviderResult] = []
-    for model_id, label in MODELS.items():
+    for model_id, label in active_models.items():
         # When models are specified, Open-Meteo suffixes keys with _modelname
         # e.g. temperature_2m_max_ecmwf_ifs025
         # The "best_match" model uses the base keys (no suffix).
