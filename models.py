@@ -52,6 +52,14 @@ class AggregatedResult:
     tmax_range: tuple[float, float]  # (lowest tmax, highest tmax)
     sources_used: int
     warning: str | None = None
+    skewness_tmin: float = 0.0
+    skewness_tmax: float = 0.0
+    confidence: float = 0.0
+    hist_tmin_mean: float | None = None
+    hist_tmax_mean: float | None = None
+    hist_tmin_std: float | None = None
+    hist_tmax_std: float | None = None
+    hist_sample_size: int | None = None
 
 
 @dataclass

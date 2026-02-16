@@ -28,6 +28,9 @@ MODELS: dict[str, str] = {
     "jma_seamless": "JMA (Japan)",
     "ukmo_seamless": "UK Met Office",
     "metno_seamless": "MET Norway",
+    "knmi_seamless": "KNMI (Netherlands)",
+    "dmi_seamless": "DMI (Denmark)",
+    "arpae_cosmo_seamless": "ARPAE COSMO (Italy)",
 }
 
 

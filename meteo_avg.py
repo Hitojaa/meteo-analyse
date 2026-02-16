@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import cache
 from aggregate import aggregate
 from geocode import geocode
+from history import HistoricalStats, fetch_historical
 from models import (
     AggregatedResult,
     ForecastReport,
@@ -77,8 +78,9 @@ def _build_report(
     date: str,
     results: list[ProviderResult],
     errors: list[ProviderError],
+    historical: HistoricalStats | None = None,
 ) -> ForecastReport:
-    agg = aggregate(results)
+    agg = aggregate(results, historical=historical)
     return ForecastReport(
         location=loc,
         date=date,
@@ -90,6 +92,7 @@ def _build_report(
 
 
 def _report_to_dict(report: ForecastReport) -> dict[str, Any]:
+    agg = report.aggregated
     return {
         "location": {
             "name": report.location.name,
@@ -102,14 +105,26 @@ def _report_to_dict(report: ForecastReport) -> dict[str, Any]:
         "date": report.date,
         "timezone": report.timezone,
         "aggregated": {
-            "tmin_c": report.aggregated.tmin_c,
-            "tmax_c": report.aggregated.tmax_c,
-            "tmin_f": _c_to_f(report.aggregated.tmin_c),
-            "tmax_f": _c_to_f(report.aggregated.tmax_c),
-            "tmin_range": list(report.aggregated.tmin_range),
-            "tmax_range": list(report.aggregated.tmax_range),
-            "sources_used": report.aggregated.sources_used,
-            "warning": report.aggregated.warning,
+            "tmin_c": agg.tmin_c,
+            "tmax_c": agg.tmax_c,
+            "tmin_f": _c_to_f(agg.tmin_c),
+            "tmax_f": _c_to_f(agg.tmax_c),
+            "tmin_range": list(agg.tmin_range),
+            "tmax_range": list(agg.tmax_range),
+            "sources_used": agg.sources_used,
+            "confidence": agg.confidence,
+            "skewness_tmin": agg.skewness_tmin,
+            "skewness_tmax": agg.skewness_tmax,
+            "warning": agg.warning,
+            "historical": {
+                "tmin_mean": agg.hist_tmin_mean,
+                "tmax_mean": agg.hist_tmax_mean,
+                "tmin_std": agg.hist_tmin_std,
+                "tmax_std": agg.hist_tmax_std,
+                "sample_size": agg.hist_sample_size,
+            }
+            if agg.hist_tmin_mean is not None
+            else None,
         },
         "per_provider": [
             {
@@ -135,26 +150,67 @@ def _c_to_f(c: float) -> float:
     return round(c * 9 / 5 + 32, 1)
 
 
+def _skew_label(skew: float) -> str:
+    """Human-readable skewness interpretation."""
+    if abs(skew) < 0.3:
+        return "symmetric"
+    elif skew > 0:
+        return f"+{skew:.2f} (high bias)"
+    else:
+        return f"{skew:.2f} (low bias)"
+
+
 def _print_table(report: ForecastReport) -> None:
     loc = report.location
     agg = report.aggregated
 
-    print(f"\n{'=' * 72}")
+    print(f"\n{'=' * 76}")
     print(f"  Location : {loc.display_name}")
     print(f"  Date     : {report.date}")
     print(f"  Timezone : {report.timezone}")
-    print(f"{'=' * 72}")
+    print(f"{'=' * 76}")
 
     if agg.warning:
         print(f"  ⚠  {agg.warning}")
 
     print(f"\n  Aggregated forecast:")
-    print(f"    Tmin : {agg.tmin_c:>6.1f} °C / {_c_to_f(agg.tmin_c):>6.1f} °F   (range: {agg.tmin_range[0]:.1f} – {agg.tmin_range[1]:.1f} °C)")
-    print(f"    Tmax : {agg.tmax_c:>6.1f} °C / {_c_to_f(agg.tmax_c):>6.1f} °F   (range: {agg.tmax_range[0]:.1f} – {agg.tmax_range[1]:.1f} °C)")
+    print(
+        f"    Tmin : {agg.tmin_c:>6.1f} °C / {_c_to_f(agg.tmin_c):>6.1f} °F"
+        f"   (range: {agg.tmin_range[0]:.1f} – {agg.tmin_range[1]:.1f} °C)"
+    )
+    print(
+        f"    Tmax : {agg.tmax_c:>6.1f} °C / {_c_to_f(agg.tmax_c):>6.1f} °F"
+        f"   (range: {agg.tmax_range[0]:.1f} – {agg.tmax_range[1]:.1f} °C)"
+    )
     print(f"    Sources used: {agg.sources_used}")
+    print(f"    Confidence: {agg.confidence:.0f}%")
+    print(
+        f"    Skewness: Tmin {_skew_label(agg.skewness_tmin)}"
+        f"  |  Tmax {_skew_label(agg.skewness_tmax)}"
+    )
 
-    print(f"\n  {'Provider':<20} {'Tmin':>14} {'Tmax':>14} {'Quality':<22}")
-    print(f"  {'-' * 70}")
+    # Historical context
+    if agg.hist_tmin_mean is not None:
+        print(f"\n  Historical context (5-year climatology ±5 days, n={agg.hist_sample_size}):")
+        print(
+            f"    Tmin avg: {agg.hist_tmin_mean:>5.1f} °C"
+            f" (σ {agg.hist_tmin_std:.1f}°C)"
+            f"  |  Tmax avg: {agg.hist_tmax_mean:>5.1f} °C"
+            f" (σ {agg.hist_tmax_std:.1f}°C)"
+        )
+        # Show anomaly
+        tmin_anom = agg.tmin_c - agg.hist_tmin_mean
+        tmax_anom = agg.tmax_c - agg.hist_tmax_mean
+        tmin_sign = "+" if tmin_anom >= 0 else ""
+        tmax_sign = "+" if tmax_anom >= 0 else ""
+        print(
+            f"    Anomaly : Tmin {tmin_sign}{tmin_anom:.1f}°C vs normal"
+            f"  |  Tmax {tmax_sign}{tmax_anom:.1f}°C vs normal"
+        )
+
+    # Provider table – wider to fit more models
+    print(f"\n  {'Provider':<25} {'Tmin':>14} {'Tmax':>14} {'Quality':<22}")
+    print(f"  {'-' * 75}")
     for p in report.per_provider:
         if p.tmin_c is not None and p.tmax_c is not None:
             tmin_s = f"{p.tmin_c:.1f}°C/{_c_to_f(p.tmin_c):.1f}°F"
@@ -162,7 +218,9 @@ def _print_table(report: ForecastReport) -> None:
         else:
             tmin_s = "N/A"
             tmax_s = "N/A"
-        print(f"  {p.provider_name:<20} {tmin_s:>14} {tmax_s:>14} {p.quality.value:<22}")
+        print(
+            f"  {p.provider_name:<25} {tmin_s:>14} {tmax_s:>14} {p.quality.value:<22}"
+        )
 
     if report.errors:
         print(f"\n  Errors:")
@@ -194,6 +252,12 @@ def main(argv: list[str] | None = None) -> None:
         dest="json_output",
         help="Output structured JSON",
     )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        dest="no_history",
+        help="Skip historical data fetch (faster, less accurate)",
+    )
     args = parser.parse_args(argv)
 
     # --- Geocode ---
@@ -217,6 +281,14 @@ def main(argv: list[str] | None = None) -> None:
             _print_table(report)
         return
 
+    # --- Fetch historical data ---
+    historical: HistoricalStats | None = None
+    if not args.no_history:
+        try:
+            historical = fetch_historical(loc.lat, loc.lon, date, loc.timezone)
+        except Exception as exc:
+            log.warning("Historical data: %s", exc)
+
     # --- Fetch from providers ---
     results, errors = _fetch_all(loc, date)
 
@@ -228,7 +300,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Build report ---
     try:
-        report = _build_report(loc, date, results, errors)
+        report = _build_report(loc, date, results, errors, historical=historical)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -273,6 +345,7 @@ def _rebuild_report_from_cache(data: dict) -> ForecastReport:
         for e in data.get("errors", [])
     ]
     agg_d = data["aggregated"]
+    hist_d = agg_d.get("historical")
     agg = AggregatedResult(
         tmin_c=agg_d["tmin_c"],
         tmax_c=agg_d["tmax_c"],
@@ -280,6 +353,14 @@ def _rebuild_report_from_cache(data: dict) -> ForecastReport:
         tmax_range=tuple(agg_d["tmax_range"]),
         sources_used=agg_d["sources_used"],
         warning=agg_d.get("warning"),
+        skewness_tmin=agg_d.get("skewness_tmin", 0.0),
+        skewness_tmax=agg_d.get("skewness_tmax", 0.0),
+        confidence=agg_d.get("confidence", 0.0),
+        hist_tmin_mean=hist_d["tmin_mean"] if hist_d else None,
+        hist_tmax_mean=hist_d["tmax_mean"] if hist_d else None,
+        hist_tmin_std=hist_d["tmin_std"] if hist_d else None,
+        hist_tmax_std=hist_d["tmax_std"] if hist_d else None,
+        hist_sample_size=hist_d["sample_size"] if hist_d else None,
     )
     return ForecastReport(
         location=loc,
