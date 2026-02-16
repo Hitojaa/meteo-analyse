@@ -1,6 +1,8 @@
 """Robust aggregation of temperature forecasts from multiple providers.
 
 Combines MAD-based outlier filtering with:
+  - Provider bias correction (from self-learning verification)
+  - Accuracy-based weighting (providers with lower MAE get more weight)
   - Skewness-aware blending (mean ↔ median)
   - Historical climatological anchoring (Bayesian shrinkage)
   - Confidence scoring
@@ -14,6 +16,11 @@ from statistics import stdev as _stdev
 
 from history import HistoricalStats
 from models import AggregatedResult, ProviderResult
+from verification import ProviderAccuracy
+
+
+# Minimum verified forecasts before applying bias correction
+MIN_VERIFICATIONS_FOR_BIAS = 3
 
 
 def _median(values: list[float]) -> float:
@@ -137,18 +144,44 @@ def _climate_anchoring(
     return estimate * (1.0 - shrinkage) + hist_mean * shrinkage
 
 
+def _accuracy_multiplier(
+    provider_name: str,
+    accuracy: dict[str, ProviderAccuracy] | None,
+) -> float:
+    """Compute a weight multiplier based on provider's verified accuracy.
+
+    Returns a value between 0.7 (poor accuracy) and 1.3 (excellent accuracy).
+    Providers with no accuracy data get a neutral 1.0.
+
+    Based on combined MAE: lower MAE → higher weight.
+      - MAE = 0°C → 1.3 (perfect)
+      - MAE = 1°C → 1.0 (baseline)
+      - MAE = 2°C → 0.83
+      - MAE ≥ 3°C → 0.7 (floor)
+    """
+    if accuracy is None:
+        return 1.0
+    acc = accuracy.get(provider_name)
+    if acc is None or acc.n < MIN_VERIFICATIONS_FOR_BIAS:
+        return 1.0
+    combined_mae = (acc.tmin_mae + acc.tmax_mae) / 2.0
+    return max(0.7, min(1.3, 2.0 / (1.0 + combined_mae)))
+
+
 def _confidence_score(
     values: list[float],
     hist_mean: float | None,
     hist_std: float | None,
     estimate: float,
+    has_accuracy: bool = False,
 ) -> float:
     """Compute a 0–100 confidence score for the aggregated estimate.
 
-    Based on three factors:
+    Based on four factors:
       1. Number of sources (more independent models → more reliable)
       2. Provider agreement (lower IQR → higher confidence)
       3. Historical consistency (closer to climatological norm → higher confidence)
+      4. Self-learning data available (verified accuracy boosts confidence)
     """
     n = len(values)
 
@@ -172,23 +205,28 @@ def _confidence_score(
     else:
         hist_score = 0.5  # neutral if no history
 
-    score = source_score * 0.3 + spread_score * 0.45 + hist_score * 0.25
-    return round(score * 100, 0)
+    # Factor 4: Self-learning bonus
+    learning_bonus = 0.08 if has_accuracy else 0.0
+
+    score = source_score * 0.3 + spread_score * 0.40 + hist_score * 0.25 + learning_bonus
+    return min(round(score * 100, 0), 99)  # Cap at 99 (never 100% certain)
 
 
 def aggregate(
     results: list[ProviderResult],
     historical: HistoricalStats | None = None,
+    provider_accuracy: dict[str, ProviderAccuracy] | None = None,
 ) -> AggregatedResult:
     """Compute a robust aggregated tmin/tmax from provider results.
 
     Steps:
       1. Filter out results with None/NaN values.
-      2. If fewer than 2 valid sources, return best estimate with a warning.
-      3. MAD-filter outliers.
-      4. Skewness-aware blend between weighted mean and median.
-      5. If historical data available, apply climate anchoring.
-      6. Compute confidence score.
+      2. Apply per-provider bias correction (if accuracy data available).
+      3. Compute quality × accuracy weights.
+      4. MAD-filter outliers.
+      5. Skewness-aware blend between weighted mean and median.
+      6. If historical data available, apply climate anchoring.
+      7. Compute confidence score.
     """
     valid = [
         r
@@ -209,9 +247,28 @@ def aggregate(
             "result may be less reliable."
         )
 
-    tmins = [r.tmin_c for r in valid]
-    tmaxs = [r.tmax_c for r in valid]
-    weights = [r.quality.weight for r in valid]
+    # Raw values (for display in range)
+    raw_tmins = [r.tmin_c for r in valid]
+    raw_tmaxs = [r.tmax_c for r in valid]
+
+    # Bias-corrected values (for aggregation)
+    tmins = list(raw_tmins)
+    tmaxs = list(raw_tmaxs)
+    bias_corrected = 0
+
+    if provider_accuracy:
+        for i, r in enumerate(valid):
+            acc = provider_accuracy.get(r.provider_name)
+            if acc and acc.n >= MIN_VERIFICATIONS_FOR_BIAS:
+                tmins[i] -= acc.tmin_bias
+                tmaxs[i] -= acc.tmax_bias
+                bias_corrected += 1
+
+    # Weights: quality × accuracy multiplier
+    weights = [
+        r.quality.weight * _accuracy_multiplier(r.provider_name, provider_accuracy)
+        for r in valid
+    ]
 
     # Filter outliers independently for tmin and tmax
     tmins_f, w_tmin = _filter_outliers(tmins, weights)
@@ -245,25 +302,20 @@ def aggregate(
         )
 
     # Confidence score (take the lower of tmin/tmax)
+    has_accuracy = provider_accuracy is not None and bias_corrected > 0
     conf_tmin = _confidence_score(
-        tmins_f,
-        hist_tmin_mean,
-        hist_tmin_std,
-        agg_tmin,
+        tmins_f, hist_tmin_mean, hist_tmin_std, agg_tmin, has_accuracy
     )
     conf_tmax = _confidence_score(
-        tmaxs_f,
-        hist_tmax_mean,
-        hist_tmax_std,
-        agg_tmax,
+        tmaxs_f, hist_tmax_mean, hist_tmax_std, agg_tmax, has_accuracy
     )
     confidence = min(conf_tmin, conf_tmax)
 
     return AggregatedResult(
         tmin_c=round(agg_tmin, 1),
         tmax_c=round(agg_tmax, 1),
-        tmin_range=(round(min(tmins), 1), round(max(tmins), 1)),
-        tmax_range=(round(min(tmaxs), 1), round(max(tmaxs), 1)),
+        tmin_range=(round(min(raw_tmins), 1), round(max(raw_tmins), 1)),
+        tmax_range=(round(min(raw_tmaxs), 1), round(max(raw_tmaxs), 1)),
         sources_used=len(valid),
         warning=warning,
         skewness_tmin=round(skew_tmin, 2),

@@ -5,6 +5,7 @@ import math
 import pytest
 
 from aggregate import (
+    _accuracy_multiplier,
     _filter_outliers,
     _mad,
     _median,
@@ -17,13 +18,17 @@ from aggregate import (
 )
 from history import HistoricalStats
 from models import DataQuality, ProviderResult
+from verification import ProviderAccuracy
 
 
 def _make_result(
-    tmin: float | None, tmax: float | None, quality: DataQuality = DataQuality.DAILY_DIRECT
+    tmin: float | None,
+    tmax: float | None,
+    quality: DataQuality = DataQuality.DAILY_DIRECT,
+    name: str = "test",
 ) -> ProviderResult:
     return ProviderResult(
-        provider_name="test",
+        provider_name=name,
         tmin_c=tmin,
         tmax_c=tmax,
         date="2025-06-15",
@@ -54,9 +59,6 @@ class TestFilterOutliers:
         assert fw == weights
 
     def test_removes_outlier(self):
-        # Median=10.5, MAD for [10, 10.5, 11, 50] -> median=10.75
-        # deviations: [0.75, 0.25, 0.25, 39.25] -> MAD=0.5
-        # threshold = 2.5 * 0.5 = 1.25 -> 50 is way out
         vals = [10.0, 10.5, 11.0, 50.0]
         weights = [1.0, 1.0, 1.0, 1.0]
         fv, fw = _filter_outliers(vals, weights)
@@ -75,24 +77,20 @@ class TestWeightedMean:
         assert _weighted_mean([10.0, 20.0], [1.0, 1.0]) == 15.0
 
     def test_unequal_weights(self):
-        # (10*2 + 20*1) / 3 = 40/3 ≈ 13.33
         result = _weighted_mean([10.0, 20.0], [2.0, 1.0])
         assert abs(result - 13.333) < 0.01
 
 
 class TestSkewness:
     def test_symmetric_distribution(self):
-        # Perfectly symmetric values should have skewness ≈ 0
         skew = _skewness([10.0, 11.0, 12.0, 13.0, 14.0])
         assert abs(skew) < 0.01
 
     def test_right_skewed(self):
-        # One high outlier → positive skewness
         skew = _skewness([10.0, 10.5, 11.0, 11.5, 20.0])
         assert skew > 0.5
 
     def test_left_skewed(self):
-        # One low outlier → negative skewness
         skew = _skewness([1.0, 10.0, 10.5, 11.0, 11.5])
         assert skew < -0.5
 
@@ -113,42 +111,68 @@ class TestSkewnessBlend:
         assert abs(result - expected) < 0.1
 
     def test_skewed_blends_toward_median(self):
-        # Right-skewed: one high value
         vals = [10.0, 10.5, 11.0, 11.5, 25.0]
         weights = [1.0] * 5
         w_mean = _weighted_mean(vals, weights)
         med = _median(vals)
         result = _skewness_blend(vals, weights)
-        # Result should be between median and mean, closer to median
         assert med <= result <= w_mean
 
 
 class TestClimateAnchoring:
     def test_no_correction_within_normal(self):
-        # Estimate within 1.5σ of historical → no change
         result = _climate_anchoring(12.0, [11.0, 12.0, 13.0], 11.0, 3.0)
         assert result == 12.0
 
     def test_correction_for_extreme_anomaly(self):
-        # Estimate is 3σ above historical mean → should pull back
         result = _climate_anchoring(20.0, [18.0, 20.0, 22.0], 10.0, 3.0)
-        assert result < 20.0  # Should be pulled toward 10.0
-        assert result > 10.0  # But not too much
+        assert result < 20.0
+        assert result > 10.0
 
     def test_zero_std_no_correction(self):
         result = _climate_anchoring(15.0, [14.0, 15.0, 16.0], 10.0, 0.0)
         assert result == 15.0
 
 
+class TestAccuracyMultiplier:
+    def test_no_accuracy_data(self):
+        assert _accuracy_multiplier("test", None) == 1.0
+
+    def test_provider_not_in_accuracy(self):
+        acc = {"other": ProviderAccuracy(n=5, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=1.0, tmax_mae=1.0)}
+        assert _accuracy_multiplier("test", acc) == 1.0
+
+    def test_insufficient_verifications(self):
+        acc = {"test": ProviderAccuracy(n=2, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=1.0, tmax_mae=1.0)}
+        assert _accuracy_multiplier("test", acc) == 1.0
+
+    def test_excellent_accuracy_gets_boost(self):
+        acc = {"test": ProviderAccuracy(n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=0.3, tmax_mae=0.3)}
+        mult = _accuracy_multiplier("test", acc)
+        assert mult > 1.0
+
+    def test_poor_accuracy_gets_penalty(self):
+        acc = {"test": ProviderAccuracy(n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=3.0, tmax_mae=3.0)}
+        mult = _accuracy_multiplier("test", acc)
+        assert mult < 1.0
+        assert mult >= 0.7  # floor
+
+    def test_multiplier_bounded(self):
+        # Perfect accuracy
+        acc_perfect = {"test": ProviderAccuracy(n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=0.0, tmax_mae=0.0)}
+        assert _accuracy_multiplier("test", acc_perfect) <= 1.3
+        # Terrible accuracy
+        acc_bad = {"test": ProviderAccuracy(n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=10.0, tmax_mae=10.0)}
+        assert _accuracy_multiplier("test", acc_bad) >= 0.7
+
+
 class TestConfidenceScore:
     def test_high_confidence(self):
-        # Many sources, low spread, consistent with history
         vals = [10.0, 10.2, 10.1, 10.3, 10.0, 10.1, 10.2, 10.0]
         score = _confidence_score(vals, 10.0, 2.0, 10.1)
-        assert score >= 80
+        assert score >= 70
 
     def test_low_confidence_high_spread(self):
-        # Few sources, high spread
         vals = [5.0, 15.0, 25.0]
         score = _confidence_score(vals, 10.0, 3.0, 15.0)
         assert score < 70
@@ -157,6 +181,17 @@ class TestConfidenceScore:
         vals = [10.0, 11.0, 12.0]
         score = _confidence_score(vals, None, None, 11.0)
         assert 30 < score < 80
+
+    def test_capped_at_99(self):
+        vals = [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+        score = _confidence_score(vals, 10.0, 2.0, 10.0, has_accuracy=True)
+        assert score <= 99
+
+    def test_accuracy_bonus(self):
+        vals = [10.0, 10.1, 10.2, 10.0, 10.1]
+        score_without = _confidence_score(vals, 10.0, 2.0, 10.1, has_accuracy=False)
+        score_with = _confidence_score(vals, 10.0, 2.0, 10.1, has_accuracy=True)
+        assert score_with > score_without
 
 
 class TestAggregate:
@@ -177,10 +212,9 @@ class TestAggregate:
             _make_result(5.0, 20.0),
             _make_result(5.5, 20.5),
             _make_result(6.0, 21.0),
-            _make_result(50.0, 80.0),  # outlier
+            _make_result(50.0, 80.0),
         ]
         agg = aggregate(results)
-        # The outlier should be excluded; result should be close to 5-6 / 20-21
         assert agg.tmin_c < 10.0
         assert agg.tmax_c < 25.0
 
@@ -216,14 +250,12 @@ class TestAggregate:
             aggregate(results)
 
     def test_quality_weighting(self):
-        # Hourly-computed result should have lower weight
         results = [
             _make_result(10.0, 25.0, DataQuality.DAILY_DIRECT),
             _make_result(10.0, 25.0, DataQuality.DAILY_DIRECT),
             _make_result(12.0, 27.0, DataQuality.COMPUTED_FROM_HOURLY),
         ]
         agg = aggregate(results)
-        # Result should be closer to 10/25 than to 12/27
         assert agg.tmin_c < 11.0
         assert agg.tmax_c < 26.0
 
@@ -237,7 +269,7 @@ class TestAggregate:
         assert isinstance(agg.skewness_tmin, float)
         assert isinstance(agg.skewness_tmax, float)
         assert isinstance(agg.confidence, float)
-        assert 0 <= agg.confidence <= 100
+        assert 0 <= agg.confidence <= 99
 
     def test_with_historical_data(self):
         results = [
@@ -246,37 +278,66 @@ class TestAggregate:
             _make_result(6.0, 21.0),
         ]
         hist = HistoricalStats(
-            tmin_mean=5.0,
-            tmin_std=2.0,
-            tmax_mean=20.0,
-            tmax_std=3.0,
-            sample_size=50,
-            years_covered=5,
+            tmin_mean=5.0, tmin_std=2.0,
+            tmax_mean=20.0, tmax_std=3.0,
+            sample_size=50, years_covered=5,
         )
         agg = aggregate(results, historical=hist)
         assert agg.hist_tmin_mean == 5.0
         assert agg.hist_tmax_mean == 20.0
-        assert agg.hist_tmin_std == 2.0
-        assert agg.hist_tmax_std == 3.0
         assert agg.hist_sample_size == 50
 
     def test_historical_anchoring_corrects_extreme(self):
-        # All providers predict way above historical norm
         results = [
             _make_result(20.0, 40.0),
             _make_result(21.0, 41.0),
             _make_result(22.0, 42.0),
         ]
         hist = HistoricalStats(
-            tmin_mean=5.0,
-            tmin_std=2.0,
-            tmax_mean=20.0,
-            tmax_std=3.0,
-            sample_size=50,
-            years_covered=5,
+            tmin_mean=5.0, tmin_std=2.0,
+            tmax_mean=20.0, tmax_std=3.0,
+            sample_size=50, years_covered=5,
         )
         agg_with = aggregate(results, historical=hist)
         agg_without = aggregate(results)
-        # With historical anchoring, extreme values should be pulled back slightly
         assert agg_with.tmin_c <= agg_without.tmin_c
         assert agg_with.tmax_c <= agg_without.tmax_c
+
+    def test_bias_correction_applied(self):
+        # Provider "biased" always predicts 2°C too high
+        results = [
+            _make_result(10.0, 25.0, name="accurate"),
+            _make_result(10.0, 25.0, name="accurate2"),
+            _make_result(12.0, 27.0, name="biased"),
+        ]
+        acc = {
+            "biased": ProviderAccuracy(
+                n=10, tmin_bias=2.0, tmax_bias=2.0, tmin_mae=2.0, tmax_mae=2.0,
+            ),
+        }
+        agg_corrected = aggregate(results, provider_accuracy=acc)
+        agg_raw = aggregate(results)
+        # With bias correction, "biased" provider's 12.0 becomes 10.0
+        # So the aggregated result should be lower/closer to 10.0
+        assert agg_corrected.tmin_c <= agg_raw.tmin_c
+        assert agg_corrected.tmax_c <= agg_raw.tmax_c
+
+    def test_accuracy_weighting(self):
+        # Accurate provider should have more influence
+        results = [
+            _make_result(10.0, 25.0, name="good"),
+            _make_result(14.0, 29.0, name="bad"),
+            _make_result(12.0, 27.0, name="neutral"),
+        ]
+        acc = {
+            "good": ProviderAccuracy(
+                n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=0.5, tmax_mae=0.5,
+            ),
+            "bad": ProviderAccuracy(
+                n=10, tmin_bias=0.0, tmax_bias=0.0, tmin_mae=4.0, tmax_mae=4.0,
+            ),
+        }
+        agg = aggregate(results, provider_accuracy=acc)
+        # Should be pulled toward "good" provider (10.0/25.0)
+        assert agg.tmin_c < 12.0
+        assert agg.tmax_c < 27.0

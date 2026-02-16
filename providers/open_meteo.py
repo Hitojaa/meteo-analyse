@@ -20,7 +20,9 @@ log = logging.getLogger(__name__)
 CORE_MODELS: dict[str, str] = {
     "best_match": "Open-Meteo (Best Match)",
     "ecmwf_ifs025": "ECMWF IFS 0.25°",
+    "ecmwf_aifs025": "ECMWF AIFS 0.25° (AI)",
     "gfs_seamless": "NOAA GFS",
+    "gfs_graphcast025": "GFS GraphCast (AI)",
     "icon_seamless": "DWD ICON",
     "meteofrance_seamless": "Météo-France",
     "gem_seamless": "Canadian GEM",

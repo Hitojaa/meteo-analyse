@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""meteo_avg – Aggregate weather forecasts from multiple providers.
+"""meteo_avg – Intelligent multi-source weather forecast aggregation.
 
 Usage:
     python meteo_avg.py "Paris"
@@ -30,6 +30,7 @@ from models import (
     ProviderResult,
 )
 from providers import open_meteo, openweather, weatherapi
+from verification import ProviderAccuracy, save_forecast, verify_and_update
 
 # Providers that return a single ProviderResult
 SINGLE_PROVIDERS = [
@@ -79,8 +80,9 @@ def _build_report(
     results: list[ProviderResult],
     errors: list[ProviderError],
     historical: HistoricalStats | None = None,
+    provider_accuracy: dict[str, ProviderAccuracy] | None = None,
 ) -> ForecastReport:
-    agg = aggregate(results, historical=historical)
+    agg = aggregate(results, historical=historical, provider_accuracy=provider_accuracy)
     return ForecastReport(
         location=loc,
         date=date,
@@ -160,7 +162,10 @@ def _skew_label(skew: float) -> str:
         return f"{skew:.2f} (low bias)"
 
 
-def _print_table(report: ForecastReport) -> None:
+def _print_table(
+    report: ForecastReport,
+    provider_accuracy: dict[str, ProviderAccuracy] | None = None,
+) -> None:
     loc = report.location
     agg = report.aggregated
 
@@ -191,14 +196,15 @@ def _print_table(report: ForecastReport) -> None:
 
     # Historical context
     if agg.hist_tmin_mean is not None:
-        print(f"\n  Historical context (5-year climatology ±5 days, n={agg.hist_sample_size}):")
+        print(
+            f"\n  Historical context (5-year climatology ±5 days, n={agg.hist_sample_size}):"
+        )
         print(
             f"    Tmin avg: {agg.hist_tmin_mean:>5.1f} °C"
             f" (σ {agg.hist_tmin_std:.1f}°C)"
             f"  |  Tmax avg: {agg.hist_tmax_mean:>5.1f} °C"
             f" (σ {agg.hist_tmax_std:.1f}°C)"
         )
-        # Show anomaly
         tmin_anom = agg.tmin_c - agg.hist_tmin_mean
         tmax_anom = agg.tmax_c - agg.hist_tmax_mean
         tmin_sign = "+" if tmin_anom >= 0 else ""
@@ -208,9 +214,44 @@ def _print_table(report: ForecastReport) -> None:
             f"  |  Tmax {tmax_sign}{tmax_anom:.1f}°C vs normal"
         )
 
-    # Provider table – wider to fit more models
-    print(f"\n  {'Provider':<25} {'Tmin':>14} {'Tmax':>14} {'Quality':<22}")
-    print(f"  {'-' * 75}")
+    # Self-learning section
+    if provider_accuracy:
+        verified_providers = [
+            (name, acc) for name, acc in provider_accuracy.items() if acc.n >= 3
+        ]
+        if verified_providers:
+            total_verified = max(acc.n for _, acc in verified_providers)
+            print(f"\n  Self-learning ({total_verified} verified forecast(s) for this location):")
+            # Top 3 most accurate providers by combined MAE
+            ranked = sorted(
+                verified_providers,
+                key=lambda x: (x[1].tmin_mae + x[1].tmax_mae) / 2,
+            )
+            top = ranked[:3]
+            top_str = ", ".join(
+                f"{name} (MAE {(a.tmin_mae + a.tmax_mae) / 2:.1f}°C)"
+                for name, a in top
+            )
+            print(f"    Best providers: {top_str}")
+            bias_count = sum(1 for _, a in verified_providers if abs(a.tmin_bias) > 0.1 or abs(a.tmax_bias) > 0.1)
+            if bias_count > 0:
+                print(f"    Bias corrections applied: {bias_count} provider(s) adjusted")
+
+    # Provider table
+    has_mae = provider_accuracy and any(
+        provider_accuracy.get(p.provider_name) and provider_accuracy[p.provider_name].n >= 3
+        for p in report.per_provider
+    )
+
+    if has_mae:
+        print(
+            f"\n  {'Provider':<27} {'Tmin':>14} {'Tmax':>14} {'MAE':>6} {'Quality':<16}"
+        )
+        print(f"  {'-' * 77}")
+    else:
+        print(f"\n  {'Provider':<27} {'Tmin':>14} {'Tmax':>14} {'Quality':<16}")
+        print(f"  {'-' * 71}")
+
     for p in report.per_provider:
         if p.tmin_c is not None and p.tmax_c is not None:
             tmin_s = f"{p.tmin_c:.1f}°C/{_c_to_f(p.tmin_c):.1f}°F"
@@ -218,9 +259,21 @@ def _print_table(report: ForecastReport) -> None:
         else:
             tmin_s = "N/A"
             tmax_s = "N/A"
-        print(
-            f"  {p.provider_name:<25} {tmin_s:>14} {tmax_s:>14} {p.quality.value:<22}"
-        )
+
+        if has_mae:
+            acc = provider_accuracy.get(p.provider_name) if provider_accuracy else None
+            mae_s = (
+                f"{(acc.tmin_mae + acc.tmax_mae) / 2:.1f}°"
+                if acc and acc.n >= 3
+                else "  -"
+            )
+            print(
+                f"  {p.provider_name:<27} {tmin_s:>14} {tmax_s:>14} {mae_s:>6} {p.quality.value:<16}"
+            )
+        else:
+            print(
+                f"  {p.provider_name:<27} {tmin_s:>14} {tmax_s:>14} {p.quality.value:<16}"
+            )
 
     if report.errors:
         print(f"\n  Errors:")
@@ -232,7 +285,7 @@ def _print_table(report: ForecastReport) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Aggregate weather forecasts from multiple providers."
+        description="Intelligent multi-source weather forecast aggregation."
     )
     parser.add_argument("city", help="City name (e.g. 'Paris', 'Lyon')")
     parser.add_argument(
@@ -276,10 +329,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.json_output:
             print(json.dumps(cached, indent=2, ensure_ascii=False))
         else:
-            # Rebuild report from cache for display
             report = _rebuild_report_from_cache(cached)
             _print_table(report)
         return
+
+    # --- Self-learning: verify past predictions & load accuracy ---
+    provider_accuracy: dict[str, ProviderAccuracy] | None = None
+    try:
+        provider_accuracy = verify_and_update(loc.lat, loc.lon, loc.timezone)
+    except Exception as exc:
+        log.warning("Verification: %s", exc)
 
     # --- Fetch historical data ---
     historical: HistoricalStats | None = None
@@ -300,10 +359,23 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Build report ---
     try:
-        report = _build_report(loc, date, results, errors, historical=historical)
+        report = _build_report(
+            loc, date, results, errors,
+            historical=historical,
+            provider_accuracy=provider_accuracy,
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # --- Self-learning: save this forecast for future verification ---
+    try:
+        save_forecast(
+            loc.lat, loc.lon, date, loc.timezone,
+            results, report.aggregated.tmin_c, report.aggregated.tmax_c,
+        )
+    except Exception as exc:
+        log.warning("Forecast save: %s", exc)
 
     # --- Cache result ---
     report_dict = _report_to_dict(report)
@@ -313,7 +385,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.json_output:
         print(json.dumps(report_dict, indent=2, ensure_ascii=False))
     else:
-        _print_table(report)
+        _print_table(report, provider_accuracy=provider_accuracy)
 
 
 def _rebuild_report_from_cache(data: dict) -> ForecastReport:
