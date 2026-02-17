@@ -338,6 +338,20 @@ def main(argv: list[str] | None = None) -> None:
         else:
             report = _rebuild_report_from_cache(cached)
             _print_table(report)
+
+            # Polymarket analysis (also from cache)
+            if not args.no_polymarket:
+                try:
+                    betting = polymarket_analyze(
+                        city=loc.display_name.split(",")[0].strip(),
+                        date=date,
+                        country=loc.country,
+                        agg=report.aggregated,
+                        providers=report.per_provider,
+                    )
+                    print(polymarket_format(betting))
+                except Exception as exc:
+                    log.warning("Polymarket analysis: %s", exc)
         return
 
     # --- Self-learning: verify past predictions & load accuracy ---
