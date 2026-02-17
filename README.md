@@ -7,6 +7,7 @@ meteo-avg combines temperature forecasts from 13+ weather models (including AI-b
 ## Features
 
 - **13 NWP models** — ECMWF IFS, ECMWF AIFS (AI), NOAA GFS, GFS GraphCast (AI), DWD ICON, Meteo-France, Canadian GEM, JMA, UK Met Office, MET Norway, KNMI, DMI, + optional WeatherAPI & OpenWeatherMap
+- **Polymarket betting analysis** — computes probability distribution over temperature bins and recommends value bets; uses °F (2°F bins) for US cities, °C (1°C bins) for others
 - **Skewness-aware aggregation** — blends weighted mean and median based on Fisher-Pearson skewness coefficient; asymmetric distributions lean toward the more robust median
 - **Historical climatology** — fetches 5-year temperature normals from Open-Meteo Archive API for Bayesian anchoring and anomaly detection
 - **Self-learning** — stores past predictions and verifies them against observed temperatures; builds a per-location accuracy profile that improves with every run
@@ -63,6 +64,9 @@ python meteo_avg.py "Tokyo" --json
 
 # Fast mode (skip historical data fetch)
 python meteo_avg.py "Berlin" --no-history
+
+# Without Polymarket analysis
+python meteo_avg.py "Tokyo" --no-polymarket
 ```
 
 ### Example output
@@ -100,6 +104,41 @@ python meteo_avg.py "Berlin" --no-history
   ...
 ```
 
+### Polymarket betting output
+
+After the forecast, the script automatically computes a probability distribution matching Polymarket temperature market bins:
+
+```
+  ====================================================================
+  POLYMARKET BETTING ANALYSIS
+  ====================================================================
+  Market     : Highest temperature in London on 2026-02-17
+  Prediction : 8.3°C  (σ ±1.2°C)
+  Confidence : 82%
+
+  Range           Prob    Chart                          Fair
+  ──────────────────────────────────────────────────────────────
+  5°C or less      1.2%  █░░░░░░░░░░░░░░░░░░░░░░░░        1¢
+  6°C              5.8%  ████░░░░░░░░░░░░░░░░░░░░░        6¢
+  7°C             17.3%  ███████████░░░░░░░░░░░░░░       17¢
+  8°C             28.7%  ██████████████████░░░░░░░       29¢  ← BEST
+  9°C             25.4%  ████████████████░░░░░░░░░       25¢
+  10°C            14.1%  █████████░░░░░░░░░░░░░░░░       14¢
+  11°C             5.6%  ████░░░░░░░░░░░░░░░░░░░░░        6¢
+  12°C or more     1.9%  █░░░░░░░░░░░░░░░░░░░░░░░░        2¢
+
+  ──────────────────────────────────────────────────────────────
+  RECOMMENDATION
+  ──────────────────────────────────────────────────────────────
+  → BUY "8°C" — our model gives 28.7% probability
+    If Polymarket price < 29¢, this is a VALUE BET
+  → Also consider: "9°C" (25.4%)
+  → Risk: LOW — High model agreement + historical consistency
+  ====================================================================
+```
+
+The probability model uses a Normal distribution centered on the aggregated Tmax, with uncertainty derived from provider ensemble spread and historical variability. Bins match Polymarket conventions: **2°F bins** for US cities, **1°C bins** for non-US cities.
+
 ## Aggregation pipeline
 
 The aggregation applies multiple layers of statistical intelligence:
@@ -135,6 +174,7 @@ Raw provider forecasts (13+ models)
 ```
 meteo_avg.py              CLI entrypoint & orchestration
 aggregate.py              Statistical aggregation pipeline
+polymarket.py             Polymarket betting probability analysis
 history.py                Historical climatology (Open-Meteo Archive API)
 verification.py           Self-learning forecast verification system
 geocode.py                City → coordinates (Nominatim + Open-Meteo fallback)
@@ -145,8 +185,9 @@ providers/
   weatherapi.py           WeatherAPI.com (optional, key required)
   openweather.py          OpenWeatherMap (optional, key required)
 tests/
-  test_aggregate.py       47 tests: aggregation, skewness, bias, confidence
-  test_providers.py       Provider response parsing (mocked HTTP)
+  test_aggregate.py       41 tests: aggregation, skewness, bias, confidence
+  test_polymarket.py      25 tests: probability distribution, bins, formatting
+  test_providers.py       6 tests: provider response parsing (mocked HTTP)
 ```
 
 ### Cache structure
@@ -191,7 +232,7 @@ tests/
 ## Tests
 
 ```bash
-# Run all 47 tests
+# Run all 72 tests
 pytest tests/ -v
 ```
 

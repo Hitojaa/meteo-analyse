@@ -29,6 +29,7 @@ from models import (
     ProviderError,
     ProviderResult,
 )
+from polymarket import analyze as polymarket_analyze, format_analysis as polymarket_format
 from providers import open_meteo, openweather, weatherapi
 from verification import ProviderAccuracy, save_forecast, verify_and_update
 
@@ -311,6 +312,12 @@ def main(argv: list[str] | None = None) -> None:
         dest="no_history",
         help="Skip historical data fetch (faster, less accurate)",
     )
+    parser.add_argument(
+        "--no-polymarket",
+        action="store_true",
+        dest="no_polymarket",
+        help="Skip Polymarket betting analysis section",
+    )
     args = parser.parse_args(argv)
 
     # --- Geocode ---
@@ -386,6 +393,20 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(report_dict, indent=2, ensure_ascii=False))
     else:
         _print_table(report, provider_accuracy=provider_accuracy)
+
+        # --- Polymarket betting analysis ---
+        if not args.no_polymarket:
+            try:
+                betting = polymarket_analyze(
+                    city=loc.display_name.split(",")[0].strip(),
+                    date=date,
+                    country=loc.country,
+                    agg=report.aggregated,
+                    providers=results,
+                )
+                print(polymarket_format(betting))
+            except Exception as exc:
+                log.warning("Polymarket analysis: %s", exc)
 
 
 def _rebuild_report_from_cache(data: dict) -> ForecastReport:
