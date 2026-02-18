@@ -40,6 +40,10 @@ def _filter_outliers(
 
     Values farther than mad_threshold * MAD from the median are discarded.
     If MAD is 0 (all values identical or only 2), no filtering is applied.
+
+    A MAD floor of 1.0°C prevents absurdly tight filtering when multiple
+    providers report near-identical values (e.g. MET Norway/KNMI/DMI
+    sharing the same underlying model).
     """
     if len(values) <= 2:
         return values, weights
@@ -49,6 +53,9 @@ def _filter_outliers(
 
     if mad == 0:
         return values, weights
+
+    # Floor: prevent filter from becoming too tight when models cluster
+    mad = max(mad, 1.0)
 
     filtered_vals: list[float] = []
     filtered_weights: list[float] = []

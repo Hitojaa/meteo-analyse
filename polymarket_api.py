@@ -243,11 +243,21 @@ def _find_best_match(
         if not markets:
             continue
 
-        # Temperature markets are typically negRisk multi-outcome
-        # Use the first market (they usually have just one)
+        description = event.get("description", "")
+        unit = _detect_unit(title, description)
+        slug = event.get("slug", "")
+
+        # NegRisk multi-outcome events: each sub-market is a binary Yes/No
+        # for one temperature range. Aggregate them into a single market.
+        if len(markets) > 1:
+            result = _parse_neg_risk_event(markets, title, slug, unit)
+            if result is not None:
+                return result
+            # Fall through to single-market parsing if negRisk parse failed
+
+        # Single market with multiple outcomes (less common)
         market = markets[0]
 
-        # Parse stringified JSON arrays
         try:
             outcomes_raw = json.loads(market.get("outcomes", "[]"))
             prices_raw = json.loads(market.get("outcomePrices", "[]"))
@@ -257,10 +267,6 @@ def _find_best_match(
 
         if not outcomes_raw or not prices_raw:
             continue
-
-        # Build unit from event description or title
-        description = event.get("description", "")
-        unit = _detect_unit(title, description)
 
         # Build outcomes
         outcomes: list[MarketOutcome] = []
@@ -273,7 +279,6 @@ def _find_best_match(
                 token_id=tid,
             ))
 
-        slug = event.get("slug", "")
         volume = float(market.get("volume", 0) or 0)
         end_date = market.get("endDate")
 
@@ -289,6 +294,105 @@ def _find_best_match(
         )
 
     return None
+
+
+def _parse_neg_risk_event(
+    markets: list[dict],
+    title: str,
+    slug: str,
+    unit: str,
+) -> TemperatureMarket | None:
+    """Parse a negRisk event where each sub-market is Yes/No for one outcome.
+
+    Polymarket temperature events are typically structured as multiple binary
+    markets, one per temperature range (e.g. "42-43°F Yes/No"). We aggregate
+    them: use groupItemTitle as the label and the Yes price as the probability.
+    """
+    outcomes: list[MarketOutcome] = []
+    total_volume = 0.0
+    any_active = False
+    end_date = None
+
+    for mkt in markets:
+        # Each sub-market should have binary Yes/No outcomes
+        try:
+            outcomes_raw = json.loads(mkt.get("outcomes", "[]"))
+            prices_raw = json.loads(mkt.get("outcomePrices", "[]"))
+            token_ids_raw = json.loads(mkt.get("clobTokenIds", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not outcomes_raw or not prices_raw:
+            continue
+
+        # Get the outcome label from groupItemTitle or question
+        label = mkt.get("groupItemTitle", "").strip()
+        if not label:
+            # Try to extract from question: "Will the highest temp be 42-43°F?"
+            question = mkt.get("question", "")
+            label = _extract_range_from_question(question)
+        if not label:
+            continue
+
+        # Find the "Yes" price and token
+        yes_price = 0.0
+        yes_token = ""
+        for i, o in enumerate(outcomes_raw):
+            if str(o).lower() == "yes":
+                if i < len(prices_raw):
+                    yes_price = float(prices_raw[i])
+                if i < len(token_ids_raw):
+                    yes_token = str(token_ids_raw[i])
+                break
+
+        outcomes.append(MarketOutcome(
+            label=label,
+            price=yes_price,
+            token_id=yes_token,
+        ))
+
+        total_volume += float(mkt.get("volume", 0) or 0)
+        if mkt.get("active", False):
+            any_active = True
+        if end_date is None:
+            end_date = mkt.get("endDate")
+
+    if not outcomes:
+        return None
+
+    # Refine unit detection from outcome labels (may contain °C or °F)
+    for o in outcomes:
+        if "°C" in o.label or "celsius" in o.label.lower():
+            unit = "°C"
+            break
+        if "°F" in o.label or "fahrenheit" in o.label.lower():
+            unit = "°F"
+            break
+
+    return TemperatureMarket(
+        title=title,
+        slug=slug,
+        url=f"https://polymarket.com/event/{slug}",
+        volume=total_volume,
+        outcomes=outcomes,
+        unit=unit,
+        active=any_active,
+        end_date=end_date,
+    )
+
+
+def _extract_range_from_question(question: str) -> str:
+    """Extract temperature range from a market question.
+
+    E.g. "Will the highest temperature be 42-43°F?" → "42-43"
+    """
+    # Match patterns like "42-43°F", "42-43", "46°F or higher", "38 or less"
+    m = re.search(r"(-?\d+(?:\s*[-–]\s*\d+)?)\s*(?:°[FC])?\s*(?:or (?:higher|more|less|lower))?", question)
+    if m:
+        result = m.group(0).strip().rstrip("?").strip()
+        # Remove unit for consistency (normalize_outcome_key will handle it)
+        return result
+    return ""
 
 
 def fetch_live_prices(
