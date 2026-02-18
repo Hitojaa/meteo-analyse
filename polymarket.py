@@ -50,6 +50,7 @@ class BettingAnalysis:
     market_found: bool = False
     market_url: str | None = None
     market_volume: float | None = None
+    market_binary: bool = False       # True if market is Yes/No format
     value_bets: list[BettingBin] = field(default_factory=list)
 
 
@@ -80,6 +81,14 @@ _US_NAMES = {
 
 def _is_us(country: str) -> bool:
     return country.lower().strip() in _US_NAMES
+
+
+def _is_binary_market(market) -> bool:
+    """Detect binary markets (Yes/No) that don't have temperature-range outcomes."""
+    for o in market.outcomes:
+        if not any(c.isdigit() for c in o.label):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +176,8 @@ def analyze(
     unit = "°F" if use_f else "°C"
 
     # If market provides different unit, use market's unit
-    if market is not None:
+    # Skip for binary markets (Yes/No) — unit can't be inferred from outcomes
+    if market is not None and not _is_binary_market(market):
         if market.unit == "°F":
             use_f = True
             unit = "°F"
@@ -212,8 +222,10 @@ def analyze(
     center += skew * sigma * 0.10
 
     # --- Generate bins ---
-    # If market exists, generate bins matching market outcomes
-    if market is not None and market.outcomes:
+    # If market exists with numeric outcomes, match them; binary markets
+    # (Yes/No) fall back to model-generated temperature bins.
+    binary = market is not None and _is_binary_market(market)
+    if market is not None and market.outcomes and not binary:
         bins = _bins_from_market(market, center, sigma, use_f, unit)
     else:
         bins = _bins_from_model(center, sigma, use_f, unit, step)
@@ -223,8 +235,8 @@ def analyze(
         best = max(bins, key=lambda b: b.prob)
         best.is_best = True
 
-    # Match with market if available
-    if market is not None:
+    # Match with market if available (skip binary markets — no bin mapping)
+    if market is not None and not binary:
         match_with_market(bins, market)
 
     # Find value bets
@@ -242,6 +254,7 @@ def analyze(
         market_found=market is not None,
         market_url=market.url if market else None,
         market_volume=market.volume if market else None,
+        market_binary=binary,
         value_bets=value_bets,
     )
 
@@ -392,7 +405,12 @@ def format_analysis(analysis: BettingAnalysis) -> str:
     lines.append(f"  Prediction : {analysis.predicted}{analysis.unit}  (σ ±{analysis.sigma}{analysis.unit})")
     lines.append(f"  Confidence : {analysis.confidence:.0f}%")
 
-    if analysis.market_found:
+    if analysis.market_found and analysis.market_binary:
+        vol_str = f"${analysis.market_volume:,.0f}" if analysis.market_volume else "N/A"
+        lines.append(f"  Live market: YES (binary Yes/No format) — Volume: {vol_str}")
+        lines.append(f"  Link       : {analysis.market_url}")
+        lines.append(f"  Note       : Binary market — cannot match temperature bins, showing model probabilities")
+    elif analysis.market_found:
         vol_str = f"${analysis.market_volume:,.0f}" if analysis.market_volume else "N/A"
         lines.append(f"  Live market: YES — Volume: {vol_str}")
         lines.append(f"  Link       : {analysis.market_url}")
