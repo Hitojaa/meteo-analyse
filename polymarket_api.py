@@ -196,7 +196,7 @@ def search_temperature_market(
         # Try broader search without date
         return _fallback_search(city, date, timeout)
 
-    return _find_best_match(events, city, date)
+    return _find_best_match(events, city, date, timeout)
 
 
 def _fallback_search(
@@ -221,11 +221,54 @@ def _fallback_search(
 
     data = resp.json()
     events = data.get("events", [])
-    return _find_best_match(events, city, date) if events else None
+    return _find_best_match(events, city, date, timeout) if events else None
+
+
+def _fetch_event_markets(slug: str, timeout: float = 10.0) -> list[dict] | None:
+    """Fetch all markets for an event by slug.
+
+    The /public-search endpoint may only return 1 market per event.
+    This fetches the full event to get all sub-markets.
+    Tries slug-based lookup first, then falls back to the /events/{slug} path.
+    """
+    with httpx.Client(timeout=timeout) as client:
+        # Try 1: GET /events?slug={slug}
+        try:
+            resp = client.get(
+                f"{GAMMA_URL}/events",
+                params={"slug": slug},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                markets = data[0].get("markets", [])
+                if markets:
+                    return markets
+            elif isinstance(data, dict):
+                markets = data.get("markets", [])
+                if markets:
+                    return markets
+        except Exception as exc:
+            log.debug("Gamma /events?slug= failed: %s", exc)
+
+        # Try 2: GET /events/{slug}
+        try:
+            resp = client.get(f"{GAMMA_URL}/events/{slug}")
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                markets = data.get("markets", [])
+                if markets:
+                    return markets
+        except Exception as exc:
+            log.debug("Gamma /events/{slug} failed: %s", exc)
+
+    log.warning("Could not fetch full event markets for slug: %s", slug)
+    return None
 
 
 def _find_best_match(
-    events: list[dict], city: str, date: str
+    events: list[dict], city: str, date: str, timeout: float = 10.0
 ) -> TemperatureMarket | None:
     """Find the best matching temperature market from event list."""
     for event in events:
@@ -243,9 +286,20 @@ def _find_best_match(
         if not markets:
             continue
 
+        slug = event.get("slug", "")
+
+        # The /public-search endpoint often returns only 1 market per event.
+        # Fetch the full event to get ALL sub-markets (negRisk events have
+        # one binary Yes/No market per temperature range).
+        if len(markets) <= 1 and slug:
+            full_markets = _fetch_event_markets(slug, timeout)
+            if full_markets and len(full_markets) > len(markets):
+                log.info("Fetched %d markets for event %s (search had %d)",
+                         len(full_markets), slug, len(markets))
+                markets = full_markets
+
         description = event.get("description", "")
         unit = _detect_unit(title, description)
-        slug = event.get("slug", "")
 
         # NegRisk multi-outcome events: each sub-market is a binary Yes/No
         # for one temperature range. Aggregate them into a single market.
