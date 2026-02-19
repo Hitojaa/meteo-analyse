@@ -30,7 +30,6 @@ from models import (
     ProviderResult,
 )
 from polymarket import analyze as polymarket_analyze, format_analysis as polymarket_format
-from polymarket_api import search_temperature_market, fetch_live_prices
 from providers import open_meteo, openweather, weatherapi
 from verification import ProviderAccuracy, save_forecast, verify_and_update
 
@@ -291,22 +290,8 @@ def _run_polymarket_analysis(
     agg: AggregatedResult,
     providers: list[ProviderResult],
 ) -> None:
-    """Fetch Polymarket market data and print betting analysis."""
+    """Print model-based betting analysis."""
     city_short = loc.display_name.split(",")[0].strip()
-
-    # Try to find a live Polymarket market
-    market = None
-    try:
-        market = search_temperature_market(city_short, date)
-        if market:
-            # Try to get real-time CLOB prices
-            live_prices = fetch_live_prices(market)
-            if live_prices:
-                for outcome in market.outcomes:
-                    if outcome.token_id in live_prices:
-                        outcome.price = live_prices[outcome.token_id]
-    except Exception as exc:
-        log.warning("Polymarket API: %s", exc)
 
     betting = polymarket_analyze(
         city=city_short,
@@ -314,7 +299,6 @@ def _run_polymarket_analysis(
         country=loc.country,
         agg=agg,
         providers=providers,
-        market=market,
     )
     print(polymarket_format(betting))
 
