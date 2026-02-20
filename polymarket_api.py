@@ -461,22 +461,51 @@ def fetch_live_prices(
     if not token_ids:
         return {}
 
+    prices: dict[str, float] = {}
+
     try:
-        payload = [{"token_id": tid, "side": "buy"} for tid in token_ids]
+        # Batch POST endpoint: side must be uppercase "BUY"
+        payload = [{"token_id": tid, "side": "BUY"} for tid in token_ids]
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(f"{CLOB_URL}/prices", json=payload)
             resp.raise_for_status()
 
-        data = resp.json()
-        prices: dict[str, float] = {}
-        for tid in token_ids:
-            entry = data.get(tid, {})
-            if isinstance(entry, dict):
-                buy_price = entry.get("buy") or entry.get("BUY")
-                if buy_price is not None:
-                    prices[tid] = float(buy_price)
-        return prices
+            data = resp.json()
+            for tid in token_ids:
+                entry = data.get(tid)
+                if entry is None:
+                    continue
+                # Response format: { "tid": { "BUY": "0.58" } }
+                if isinstance(entry, dict):
+                    buy_price = entry.get("BUY") or entry.get("buy")
+                    if buy_price is not None:
+                        prices[tid] = float(buy_price)
+                # Could also be a direct string/float
+                elif isinstance(entry, (str, int, float)):
+                    prices[tid] = float(entry)
 
     except Exception as exc:
-        log.warning("CLOB price fetch failed, using Gamma snapshots: %s", exc)
-        return {}
+        log.warning("CLOB batch price fetch failed: %s", exc)
+
+    # Fallback: individual GET requests for any missing tokens
+    missing = [tid for tid in token_ids if tid not in prices]
+    if missing:
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                for tid in missing:
+                    try:
+                        resp = client.get(
+                            f"{CLOB_URL}/price",
+                            params={"token_id": tid, "side": "BUY"},
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        # Response: { "price": "0.58" }
+                        if "price" in data:
+                            prices[tid] = float(data["price"])
+                    except Exception as exc:
+                        log.debug("CLOB price for %s failed: %s", tid, exc)
+        except Exception as exc:
+            log.warning("CLOB individual price fetch failed: %s", exc)
+
+    return prices
