@@ -3,6 +3,10 @@
 Uses the multi-model forecast distribution to compute probability
 for each temperature range and recommend optimal bets.
 
+When a live Polymarket market is found, computes a hedging strategy
+that spreads a budget across multiple adjacent ranges so that any
+winning range within the covered set yields a profit (dutching).
+
 Polymarket temperature markets resolve to the highest temperature
 recorded at a specific station, measured in whole degrees:
   - US cities  → °F, bins of 2°F  (e.g. 44-45°F)
@@ -12,9 +16,10 @@ recorded at a specific station, measured in whole degrees:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from models import AggregatedResult, ProviderResult
+from polymarket_api import TemperatureMarket
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +35,32 @@ class BettingBin:
 
 
 @dataclass
+class HedgeBet:
+    """A single bet within a hedging strategy."""
+    label: str
+    market_price: float    # cost per share (0.0–1.0)
+    model_prob: float      # our model's probability
+    stake: float           # $ allocated to this range
+    shares: float          # shares = stake / price
+    payout: float          # payout if this range wins = shares
+
+
+@dataclass
+class HedgingStrategy:
+    """A dutching strategy that covers multiple adjacent ranges."""
+    budget: float
+    bets: list[HedgeBet]
+    sum_prices: float            # sum of market prices for covered ranges
+    payout_if_wins: float        # guaranteed payout if any covered range wins
+    profit_if_wins: float        # payout - budget
+    loss_if_misses: float        # -budget
+    model_prob_covered: float    # model probability of covered ranges winning
+    expected_value: float        # EV = prob × profit + (1-prob) × loss
+    market_url: str | None = None
+    market_volume: float | None = None
+
+
+@dataclass
 class BettingAnalysis:
     """Betting analysis based on model probability distribution."""
     city: str
@@ -40,6 +71,7 @@ class BettingAnalysis:
     bins: list[BettingBin]
     skewness: float
     confidence: float
+    hedging: HedgingStrategy | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +104,133 @@ def _is_us(country: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Model probability for a market outcome
+# ---------------------------------------------------------------------------
+
+def _prob_for_outcome(
+    label: str, center: float, sigma: float,
+) -> float:
+    """Compute our model's probability for a Polymarket outcome label."""
+    import re
+    low = label.lower()
+
+    # Tail: "X or less"
+    if "or less" in low or "or lower" in low or "or below" in low:
+        nums = re.findall(r"-?\d+", label)
+        if nums:
+            upper = int(nums[-1])
+            return _normal_cdf(upper + 0.5, center, sigma)
+        return 0.0
+
+    # Tail: "X or more"
+    if "or more" in low or "or higher" in low or "or above" in low:
+        nums = re.findall(r"-?\d+", label)
+        if nums:
+            lower = int(nums[0])
+            return 1.0 - _normal_cdf(lower - 0.5, center, sigma)
+        return 0.0
+
+    # Range: "44-45"
+    range_match = re.match(r".*?(-?\d+)\s*[-–]\s*(\d+)", label)
+    if range_match:
+        lo_val = int(range_match.group(1))
+        hi_val = int(range_match.group(2))
+        return _normal_cdf(hi_val + 0.5, center, sigma) - _normal_cdf(lo_val - 0.5, center, sigma)
+
+    # Single value: "8"
+    single_match = re.search(r"(-?\d+)", label)
+    if single_match:
+        val = int(single_match.group(1))
+        return _normal_cdf(val + 0.5, center, sigma) - _normal_cdf(val - 0.5, center, sigma)
+
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Hedging strategy
+# ---------------------------------------------------------------------------
+
+def _compute_hedging(
+    market: TemperatureMarket,
+    center: float,
+    sigma: float,
+    budget: float = 10.0,
+    min_model_prob: float = 0.03,
+) -> HedgingStrategy | None:
+    """Compute a dutching hedging strategy across market outcomes.
+
+    Selects active outcomes where our model gives >= min_model_prob,
+    then allocates budget proportionally to market prices so that
+    the payout is equal regardless of which covered range wins.
+
+    Returns None if no valid hedging strategy can be built.
+    """
+    # Filter: only active outcomes with real prices and decent model prob
+    candidates = []
+    for o in market.outcomes:
+        if o.price <= 0.005:
+            continue  # skip resolved/dead markets
+        model_p = _prob_for_outcome(o.label, center, sigma)
+        if model_p >= min_model_prob:
+            candidates.append((o.label, o.price, model_p))
+
+    if not candidates:
+        return None
+
+    # Sort by model probability descending and take the best cluster
+    candidates.sort(key=lambda x: x[2], reverse=True)
+
+    # Select ranges: take top ranges until cumulative model prob > 90%
+    # or we've covered all significant ranges
+    selected = []
+    cum_prob = 0.0
+    for label, price, model_p in candidates:
+        selected.append((label, price, model_p))
+        cum_prob += model_p
+        if cum_prob >= 0.90:
+            break
+
+    sum_prices = sum(p for _, p, _ in selected)
+    if sum_prices <= 0:
+        return None
+
+    # Dutching: allocate proportionally to market price
+    # This gives equal payout for any winning range
+    payout = budget / sum_prices  # guaranteed payout if any covered wins
+    profit = payout - budget
+
+    bets = []
+    model_prob_covered = 0.0
+    for label, price, model_p in selected:
+        stake = budget * (price / sum_prices)
+        shares = stake / price  # = budget / sum_prices (same for all)
+        bets.append(HedgeBet(
+            label=label,
+            market_price=price,
+            model_prob=model_p,
+            stake=round(stake, 2),
+            shares=round(shares, 2),
+            payout=round(shares, 2),
+        ))
+        model_prob_covered += model_p
+
+    ev = model_prob_covered * profit + (1 - model_prob_covered) * (-budget)
+
+    return HedgingStrategy(
+        budget=budget,
+        bets=bets,
+        sum_prices=round(sum_prices, 4),
+        payout_if_wins=round(payout, 2),
+        profit_if_wins=round(profit, 2),
+        loss_if_misses=round(-budget, 2),
+        model_prob_covered=round(model_prob_covered, 4),
+        expected_value=round(ev, 2),
+        market_url=market.url,
+        market_volume=market.volume,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core analysis
 # ---------------------------------------------------------------------------
 
@@ -81,6 +240,8 @@ def analyze(
     country: str,
     agg: AggregatedResult,
     providers: list[ProviderResult],
+    market: TemperatureMarket | None = None,
+    budget: float = 10.0,
 ) -> BettingAnalysis:
     """Build a probability distribution over Polymarket temperature bins.
 
@@ -91,6 +252,8 @@ def analyze(
     Bins match Polymarket conventions:
       - US: 2°F bins aligned to even integers (42-43, 44-45, …)
       - Non-US: 1°C bins (7, 8, 9, …)
+
+    If a live market is provided, computes a hedging strategy.
     """
     use_f = _is_us(country)
     unit = "°F" if use_f else "°C"
@@ -139,6 +302,11 @@ def analyze(
         best = max(bins, key=lambda b: b.prob)
         best.is_best = True
 
+    # --- Hedging strategy ---
+    hedging = None
+    if market is not None and market.outcomes:
+        hedging = _compute_hedging(market, center, sigma, budget)
+
     return BettingAnalysis(
         city=city,
         date=date,
@@ -148,6 +316,7 @@ def analyze(
         bins=bins,
         skewness=skew,
         confidence=agg.confidence,
+        hedging=hedging,
     )
 
 
@@ -235,7 +404,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
 
     lines.append("")
 
-    # --- Table: model only with bar chart ---
+    # --- Table: model probabilities with bar chart ---
     max_label = max(len(b.label) for b in analysis.bins)
     bar_width = 25
     header = f"  {'Range':<{max_label}}  {'Prob':>6}  {'':^{bar_width}}  {'Fair':>5}"
@@ -254,23 +423,75 @@ def format_analysis(analysis: BettingAnalysis) -> str:
             f"  {b.label:<{max_label}}  {pct:>5.1f}%  {bar}  {price:>5}{marker}"
         )
 
-    # --- Recommendation ---
-    lines.append("")
-    lines.append(f"  {'─' * W}")
-    lines.append(f"  RECOMMENDATION")
-    lines.append(f"  {'─' * W}")
+    # --- Hedging strategy ---
+    h = analysis.hedging
+    if h is not None and h.bets:
+        lines.append("")
+        lines.append(f"  {'=' * W}")
+        lines.append(f"  HEDGING STRATEGY (Budget: ${h.budget:.0f})")
+        lines.append(f"  {'=' * W}")
 
-    best = next((b for b in analysis.bins if b.is_best), analysis.bins[0])
-    best_pct = best.prob * 100
-    lines.append(f"  → BUY \"{best.label}\" — our model gives {best_pct:.1f}% probability")
-    lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
+        if h.market_url:
+            vol_str = f"${h.market_volume:,.0f}" if h.market_volume else "N/A"
+            lines.append(f"  Market : {h.market_url}")
+            lines.append(f"  Volume : {vol_str}")
 
-    sorted_bins = sorted(analysis.bins, key=lambda b: b.prob, reverse=True)
-    if len(sorted_bins) > 1:
-        second = sorted_bins[1]
-        lines.append(f"  → Also consider: \"{second.label}\" ({second.prob * 100:.1f}%)")
+        lines.append("")
+        lines.append(f"  {'Range':<16} {'Price':>6} {'Model':>6} {'Stake':>7} {'Shares':>7}")
+        lines.append(f"  {'─' * 50}")
+
+        for bet in h.bets:
+            lines.append(
+                f"  {bet.label:<16} {bet.market_price * 100:>5.1f}¢ "
+                f"{bet.model_prob * 100:>5.1f}% "
+                f"${bet.stake:>5.2f}  "
+                f"{bet.shares:>6.1f}"
+            )
+
+        lines.append(f"  {'─' * 50}")
+        lines.append(f"  Total prices   : {h.sum_prices * 100:.1f}¢")
+        lines.append("")
+
+        # P/L summary
+        lines.append(f"  {'─' * W}")
+        lines.append(f"  PROFIT / LOSS")
+        lines.append(f"  {'─' * W}")
+
+        if h.profit_if_wins > 0:
+            lines.append(f"  ✓ If ANY covered range wins → +${h.profit_if_wins:.2f} profit")
+        else:
+            lines.append(f"  ~ If ANY covered range wins → ${h.profit_if_wins:.2f}")
+        lines.append(f"  ✗ If NONE wins              → -${h.budget:.2f} loss")
+        lines.append("")
+        lines.append(f"  Coverage    : {h.model_prob_covered * 100:.0f}% (model probability)")
+        lines.append(f"  Expected    : ${h.expected_value:+.2f}")
+
+        if h.sum_prices < 1.0:
+            margin = (1.0 - h.sum_prices) * 100
+            lines.append(f"  Arb margin  : {margin:.1f}% — GUARANTEED PROFIT on covered ranges")
+        else:
+            overpay = (h.sum_prices - 1.0) * 100
+            lines.append(f"  Overround   : {overpay:.1f}% — no pure arbitrage, but hedged")
+
+    else:
+        # No market — model-only recommendation
+        lines.append("")
+        lines.append(f"  {'─' * W}")
+        lines.append(f"  RECOMMENDATION")
+        lines.append(f"  {'─' * W}")
+
+        best = next((b for b in analysis.bins if b.is_best), analysis.bins[0])
+        best_pct = best.prob * 100
+        lines.append(f"  → BUY \"{best.label}\" — our model gives {best_pct:.1f}% probability")
+        lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
+
+        sorted_bins = sorted(analysis.bins, key=lambda b: b.prob, reverse=True)
+        if len(sorted_bins) > 1:
+            second = sorted_bins[1]
+            lines.append(f"  → Also consider: \"{second.label}\" ({second.prob * 100:.1f}%)")
 
     # Risk assessment
+    lines.append("")
     if analysis.confidence >= 70:
         risk_label = "LOW"
         risk_note = "High model agreement + historical consistency"
