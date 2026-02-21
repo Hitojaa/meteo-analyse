@@ -3,9 +3,10 @@
 Uses the multi-model forecast distribution to compute probability
 for each temperature range and recommend optimal bets.
 
-When a live Polymarket market is found, computes a hedging strategy
-that spreads a budget across multiple adjacent ranges so that any
-winning range within the covered set yields a profit (dutching).
+When a live Polymarket market is found, computes a value-betting
+strategy that targets mispriced outcomes where our model probability
+exceeds the market ask price.  Positions are sized using the Kelly
+criterion for optimal growth.
 
 Polymarket temperature markets resolve to the highest temperature
 recorded at a specific station, measured in whole degrees:
@@ -36,10 +37,11 @@ class BettingBin:
 
 @dataclass
 class HedgeBet:
-    """A single bet within a hedging strategy."""
+    """A single value bet within a strategy."""
     label: str
-    market_price: float    # cost per share (0.0–1.0)
+    market_price: float    # ask price (0.0–1.0)
     model_prob: float      # our model's probability
+    edge: float            # model_prob - market_price
     stake: float           # $ allocated to this range
     shares: float          # shares = stake / price
     payout: float          # payout if this range wins = shares
@@ -47,15 +49,13 @@ class HedgeBet:
 
 @dataclass
 class HedgingStrategy:
-    """A dutching strategy that covers multiple adjacent ranges."""
+    """A value-betting strategy targeting mispriced outcomes."""
     budget: float
     bets: list[HedgeBet]
-    sum_prices: float            # sum of market prices for covered ranges
-    payout_if_wins: float        # guaranteed payout if any covered range wins
-    profit_if_wins: float        # payout - budget
-    loss_if_misses: float        # -budget
-    model_prob_covered: float    # model probability of covered ranges winning
-    expected_value: float        # EV = prob × profit + (1-prob) × loss
+    total_staked: float          # sum of stakes (≈ budget)
+    model_prob_covered: float    # sum of model probs for bet outcomes
+    expected_value: float        # EV = Σ(prob × payout) − total_staked
+    num_outcomes: int = 0        # total outcomes in market
     market_url: str | None = None
     market_volume: float | None = None
     price_source: str = "snapshot"  # "live" or "snapshot"
@@ -148,7 +148,7 @@ def _prob_for_outcome(
 
 
 # ---------------------------------------------------------------------------
-# Hedging strategy
+# Value betting strategy
 # ---------------------------------------------------------------------------
 
 def _compute_hedging(
@@ -156,76 +156,69 @@ def _compute_hedging(
     center: float,
     sigma: float,
     budget: float = 10.0,
-    min_model_prob: float = 0.03,
+    min_edge: float = 0.02,
 ) -> HedgingStrategy | None:
-    """Compute a dutching hedging strategy across market outcomes.
+    """Compute a value-betting strategy targeting mispriced outcomes.
 
-    Selects active outcomes where our model gives >= min_model_prob,
-    then allocates budget proportionally to market prices so that
-    the payout is equal regardless of which covered range wins.
+    Only bets on outcomes where our model probability exceeds the market
+    ask price by at least *min_edge*.  Positions are sized using the
+    Kelly criterion: kelly_i = edge_i / (1 − price_i).
 
-    Returns None if no valid hedging strategy can be built.
+    Returns None if no value bets are found.
     """
-    # Filter: only active outcomes with real prices and decent model prob
-    candidates = []
+    num_outcomes = len(market.outcomes)
+
+    # Find value bets: model_prob > market_price + min_edge
+    value_bets: list[tuple[str, float, float, float, float]] = []
     for o in market.outcomes:
         if o.price <= 0.005:
-            continue  # skip resolved/dead markets
+            continue
         model_p = _prob_for_outcome(o.label, center, sigma)
-        if model_p >= min_model_prob:
-            candidates.append((o.label, o.price, model_p))
+        edge = model_p - o.price
+        if edge >= min_edge:
+            kelly = edge / (1.0 - o.price)
+            value_bets.append((o.label, o.price, model_p, edge, kelly))
 
-    if not candidates:
+    if not value_bets:
         return None
 
-    # Sort by model probability descending and take the best cluster
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    # Sort by edge descending (best value first)
+    value_bets.sort(key=lambda x: x[3], reverse=True)
 
-    # Select ranges: take top ranges until cumulative model prob > 90%
-    # or we've covered all significant ranges
-    selected = []
-    cum_prob = 0.0
-    for label, price, model_p in candidates:
-        selected.append((label, price, model_p))
-        cum_prob += model_p
-        if cum_prob >= 0.90:
-            break
-
-    sum_prices = sum(p for _, p, _ in selected)
-    if sum_prices <= 0:
+    # Allocate budget proportionally to Kelly fraction
+    total_kelly = sum(k for _, _, _, _, k in value_bets)
+    if total_kelly <= 0:
         return None
-
-    # Dutching: allocate proportionally to market price
-    # This gives equal payout for any winning range
-    payout = budget / sum_prices  # guaranteed payout if any covered wins
-    profit = payout - budget
 
     bets = []
     model_prob_covered = 0.0
-    for label, price, model_p in selected:
-        stake = budget * (price / sum_prices)
-        shares = stake / price  # = budget / sum_prices (same for all)
+    total_staked = 0.0
+
+    for label, price, model_p, edge, kelly in value_bets:
+        stake = budget * (kelly / total_kelly)
+        shares = stake / price
         bets.append(HedgeBet(
             label=label,
             market_price=price,
             model_prob=model_p,
+            edge=round(edge, 4),
             stake=round(stake, 2),
-            shares=round(shares, 2),
+            shares=round(shares, 1),
             payout=round(shares, 2),
         ))
         model_prob_covered += model_p
+        total_staked += stake
 
-    ev = model_prob_covered * profit + (1 - model_prob_covered) * (-budget)
+    # EV = Σ(prob_i × payout_i) − total_staked  (mutually exclusive outcomes)
+    ev = sum(b.model_prob * b.payout for b in bets) - total_staked
 
     return HedgingStrategy(
         budget=budget,
         bets=bets,
-        sum_prices=round(sum_prices, 4),
-        payout_if_wins=round(payout, 2),
-        profit_if_wins=round(profit, 2),
-        loss_if_misses=round(-budget, 2),
+        total_staked=round(total_staked, 2),
         model_prob_covered=round(model_prob_covered, 4),
         expected_value=round(ev, 2),
+        num_outcomes=num_outcomes,
         market_url=market.url,
         market_volume=market.volume,
     )
@@ -424,12 +417,12 @@ def format_analysis(analysis: BettingAnalysis) -> str:
             f"  {b.label:<{max_label}}  {pct:>5.1f}%  {bar}  {price:>5}{marker}"
         )
 
-    # --- Hedging strategy ---
+    # --- Value bets ---
     h = analysis.hedging
     if h is not None and h.bets:
         lines.append("")
         lines.append(f"  {'=' * W}")
-        lines.append(f"  HEDGING STRATEGY (Budget: ${h.budget:.0f})")
+        lines.append(f"  VALUE BETS (Budget: ${h.budget:.0f})")
         lines.append(f"  {'=' * W}")
 
         if h.market_url:
@@ -441,20 +434,27 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         else:
             lines.append(f"  Prices : ⚠ SNAPSHOT (Gamma API – may be stale)")
 
+        skipped = h.num_outcomes - len(h.bets)
+        lines.append(f"  Edge   : {len(h.bets)} value bets"
+                      f" (skipped {skipped} with no edge)" if skipped else
+                      f"  Edge   : {len(h.bets)} value bets")
+
         lines.append("")
-        lines.append(f"  {'Range':<16} {'Price':>6} {'Model':>6} {'Stake':>7} {'Shares':>7}")
-        lines.append(f"  {'─' * 50}")
+        lines.append(f"  {'Range':<16} {'Price':>6} {'Model':>6}"
+                      f" {'Edge':>6} {'Stake':>7} {'If wins':>8}")
+        lines.append(f"  {'─' * 56}")
 
         for bet in h.bets:
+            net_profit = bet.payout - h.total_staked
             lines.append(
                 f"  {bet.label:<16} {bet.market_price * 100:>5.1f}¢ "
                 f"{bet.model_prob * 100:>5.1f}% "
+                f"+{bet.edge * 100:>4.1f}¢ "
                 f"${bet.stake:>5.2f}  "
-                f"{bet.shares:>6.1f}"
+                f"${net_profit:>+7.2f}"
             )
 
-        lines.append(f"  {'─' * 50}")
-        lines.append(f"  Total prices   : {h.sum_prices * 100:.1f}¢")
+        lines.append(f"  {'─' * 56}")
         lines.append("")
 
         # P/L summary
@@ -462,21 +462,11 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         lines.append(f"  PROFIT / LOSS")
         lines.append(f"  {'─' * W}")
 
-        if h.profit_if_wins > 0:
-            lines.append(f"  ✓ If ANY covered range wins → +${h.profit_if_wins:.2f} profit")
-        else:
-            lines.append(f"  ~ If ANY covered range wins → ${h.profit_if_wins:.2f}")
-        lines.append(f"  ✗ If NONE wins              → -${h.budget:.2f} loss")
+        lines.append(f"  ✗ If NONE wins → -${h.total_staked:.2f} loss")
         lines.append("")
-        lines.append(f"  Coverage    : {h.model_prob_covered * 100:.0f}% (model probability)")
-        lines.append(f"  Expected    : ${h.expected_value:+.2f}")
-
-        if h.sum_prices < 1.0:
-            margin = (1.0 - h.sum_prices) * 100
-            lines.append(f"  Arb margin  : {margin:.1f}% — GUARANTEED PROFIT on covered ranges")
-        else:
-            overpay = (h.sum_prices - 1.0) * 100
-            lines.append(f"  Overround   : {overpay:.1f}% — no pure arbitrage, but hedged")
+        lines.append(f"  Coverage : {h.model_prob_covered * 100:.0f}%"
+                      f" (model probability of a value bet winning)")
+        lines.append(f"  Expected : ${h.expected_value:+.2f}")
 
     else:
         # No market — model-only recommendation

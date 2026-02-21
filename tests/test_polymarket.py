@@ -300,13 +300,14 @@ def _make_market(
 
 
 class TestComputeHedging:
-    def test_basic_hedging_returns_strategy(self):
+    def test_basic_value_bets_returns_strategy(self):
+        """With underpriced outcomes, should find value bets."""
         market = _make_market([
-            ("8°C or less", 0.05),
-            ("9°C", 0.15),
-            ("10°C", 0.40),
-            ("11°C", 0.30),
-            ("12°C or more", 0.10),
+            ("8°C or less", 0.02),
+            ("9°C", 0.10),
+            ("10°C", 0.20),
+            ("11°C", 0.15),
+            ("12°C or more", 0.05),
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
@@ -314,41 +315,49 @@ class TestComputeHedging:
 
     def test_budget_fully_allocated(self):
         market = _make_market([
-            ("9°C", 0.15),
-            ("10°C", 0.40),
-            ("11°C", 0.30),
-            ("12°C or more", 0.10),
+            ("9°C", 0.10),
+            ("10°C", 0.20),
+            ("11°C", 0.15),
+            ("12°C or more", 0.05),
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
         total_stake = sum(bet.stake for bet in h.bets)
         assert abs(total_stake - 10.0) < 0.05
 
-    def test_payout_equal_across_bets(self):
-        """Dutching: all bets should yield the same payout."""
-        market = _make_market([
-            ("9°C", 0.15),
-            ("10°C", 0.40),
-            ("11°C", 0.30),
-        ])
-        h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
-        assert h is not None
-        payouts = [bet.payout for bet in h.bets]
-        # All payouts should be equal (shares = budget / sum_prices for all)
-        for p in payouts:
-            assert abs(p - payouts[0]) < 0.01
-
-    def test_arb_when_sum_prices_under_one(self):
-        """When sum of market prices < 1.0, profit should be positive."""
+    def test_only_positive_edge_bets(self):
+        """All selected bets should have positive edge (model > price)."""
         market = _make_market([
             ("9°C", 0.10),
-            ("10°C", 0.30),
-            ("11°C", 0.20),
+            ("10°C", 0.20),
+            ("11°C", 0.15),
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
-        assert h.sum_prices < 1.0
-        assert h.profit_if_wins > 0
+        for bet in h.bets:
+            assert bet.edge > 0
+            assert bet.model_prob > bet.market_price
+
+    def test_positive_ev_on_underpriced_market(self):
+        """When outcomes are underpriced, EV should be positive."""
+        market = _make_market([
+            ("9°C", 0.10),
+            ("10°C", 0.15),
+            ("11°C", 0.10),
+        ])
+        h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
+        assert h is not None
+        assert h.expected_value > 0
+
+    def test_no_bets_when_all_overpriced(self):
+        """When all outcomes are overpriced, should return None."""
+        market = _make_market([
+            ("9°C", 0.50),
+            ("10°C", 0.80),
+            ("11°C", 0.50),
+        ])
+        h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
+        assert h is None
 
     def test_no_hedging_when_all_prices_zero(self):
         market = _make_market([
@@ -358,12 +367,12 @@ class TestComputeHedging:
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is None
 
-    def test_skips_low_model_prob_outcomes(self):
-        """Outcomes with very low model probability should be excluded."""
+    def test_skips_no_edge_outcomes(self):
+        """Overpriced outcomes should be excluded."""
         market = _make_market([
-            ("1°C", 0.05),   # far from center=10, model prob < 3%
-            ("10°C", 0.40),
-            ("11°C", 0.30),
+            ("1°C", 0.05),   # far from center=10, no edge
+            ("10°C", 0.20),  # model ~26%, price 20% → edge
+            ("11°C", 0.15),  # model ~21%, price 15% → edge
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
@@ -372,9 +381,9 @@ class TestComputeHedging:
 
     def test_expected_value_computed(self):
         market = _make_market([
-            ("9°C", 0.15),
-            ("10°C", 0.40),
-            ("11°C", 0.30),
+            ("9°C", 0.10),
+            ("10°C", 0.20),
+            ("11°C", 0.15),
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
@@ -382,13 +391,25 @@ class TestComputeHedging:
 
     def test_market_url_and_volume_set(self):
         market = _make_market([
-            ("10°C", 0.40),
-            ("11°C", 0.30),
+            ("10°C", 0.20),
+            ("11°C", 0.15),
         ])
         h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
         assert h is not None
         assert h.market_url == "https://polymarket.com/event/test-market"
         assert h.market_volume == 50000.0
+
+    def test_kelly_allocates_more_to_bigger_edge(self):
+        """Larger edge should get proportionally more stake."""
+        market = _make_market([
+            ("10°C", 0.10),  # model ~26%, big edge
+            ("11°C", 0.18),  # model ~21%, smaller edge
+        ])
+        h = _compute_hedging(market, center=10.0, sigma=1.5, budget=10.0)
+        assert h is not None
+        assert len(h.bets) == 2
+        # First bet (sorted by edge) should have higher stake
+        assert h.bets[0].stake >= h.bets[1].stake
 
 
 class TestAnalyzeWithMarket:
@@ -396,10 +417,10 @@ class TestAnalyzeWithMarket:
         providers = [_make_provider(10.0 + i * 0.3) for i in range(5)]
         agg = _make_agg(10.5)
         market = _make_market([
-            ("9°C", 0.10),
-            ("10°C", 0.35),
-            ("11°C", 0.35),
-            ("12°C or more", 0.10),
+            ("9°C", 0.05),
+            ("10°C", 0.30),
+            ("11°C", 0.30),
+            ("12°C or more", 0.05),
         ])
         result = analyze("Paris", "2026-02-17", "France", agg, providers, market=market)
         assert result.hedging is not None
@@ -411,16 +432,16 @@ class TestAnalyzeWithMarket:
         result = analyze("Paris", "2026-02-17", "France", agg, providers)
         assert result.hedging is None
 
-    def test_format_shows_hedging_section(self):
+    def test_format_shows_value_bets_section(self):
         providers = [_make_provider(10.0 + i * 0.3) for i in range(5)]
         agg = _make_agg(10.5)
         market = _make_market([
-            ("9°C", 0.10),
-            ("10°C", 0.35),
-            ("11°C", 0.35),
-            ("12°C or more", 0.10),
+            ("9°C", 0.05),
+            ("10°C", 0.30),
+            ("11°C", 0.30),
+            ("12°C or more", 0.05),
         ])
         result = analyze("Paris", "2026-02-17", "France", agg, providers, market=market)
         output = format_analysis(result)
-        assert "HEDGING" in output
+        assert "VALUE BETS" in output
         assert "PROFIT" in output
