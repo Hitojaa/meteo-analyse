@@ -471,12 +471,14 @@ def fetch_live_prices(
 
     prices: dict[str, float] = {}
 
-    # Strategy: try batch POST first, then individual GET for any missing.
-    # Individual GET /price?side=BUY is documented as most reliable.
+    # CLOB order book sides:
+    #   "BUY"  = best bid (highest price a buyer offers)
+    #   "SELL" = best ask (lowest price a seller offers) = what you'd pay to buy
+    # We want the ASK price to match the website's "Buy Yes" / "Acheter Oui".
     batch_count = 0
 
     try:
-        payload = [{"token_id": tid, "side": "BUY"} for tid in token_ids]
+        payload = [{"token_id": tid, "side": "SELL"} for tid in token_ids]
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(f"{CLOB_URL}/prices", json=payload)
             resp.raise_for_status()
@@ -488,14 +490,14 @@ def fetch_live_prices(
                     if entry is None:
                         continue
                     if isinstance(entry, dict):
-                        buy_price = entry.get("BUY") or entry.get("buy")
-                        if buy_price is not None:
-                            prices[tid] = float(buy_price)
+                        ask_price = entry.get("SELL") or entry.get("sell")
+                        if ask_price is not None:
+                            prices[tid] = float(ask_price)
                             batch_count += 1
                     elif isinstance(entry, (str, int, float)):
                         prices[tid] = float(entry)
                         batch_count += 1
-            log.warning("CLOB batch: got %d/%d prices", batch_count, len(token_ids))
+            log.info("CLOB batch: got %d/%d ask prices", batch_count, len(token_ids))
 
     except Exception as exc:
         log.warning("CLOB batch price fetch failed: %s", exc)
@@ -503,14 +505,14 @@ def fetch_live_prices(
     # Fallback: individual GET requests for any missing tokens
     missing = [tid for tid in token_ids if tid not in prices]
     if missing:
-        log.warning("CLOB: %d tokens missing from batch, trying individual GET…", len(missing))
+        log.info("CLOB: %d tokens missing from batch, trying individual GET…", len(missing))
         try:
             with httpx.Client(timeout=timeout) as client:
                 for tid in missing:
                     try:
                         resp = client.get(
                             f"{CLOB_URL}/price",
-                            params={"token_id": tid, "side": "BUY"},
+                            params={"token_id": tid, "side": "SELL"},
                         )
                         resp.raise_for_status()
                         data = resp.json()
@@ -523,6 +525,6 @@ def fetch_live_prices(
         except Exception as exc:
             log.warning("CLOB individual price fetch failed: %s", exc)
 
-    log.warning("CLOB prices: total %d/%d live (batch=%d, GET=%d)",
-                len(prices), len(token_ids), batch_count, len(prices) - batch_count)
+    log.info("CLOB prices: total %d/%d live (batch=%d, GET=%d)",
+             len(prices), len(token_ids), batch_count, len(prices) - batch_count)
     return prices
