@@ -296,15 +296,29 @@ def _run_polymarket_analysis(
 
     # Try to fetch live Polymarket market data for hedging
     market = None
+    price_source = "snapshot"
     try:
         market = search_temperature_market(city_short, date)
         if market and market.outcomes:
             # Refresh with live CLOB prices
             live_prices = fetch_live_prices(market)
+            n_total = len([o for o in market.outcomes if o.token_id])
+            n_live = 0
             if live_prices:
                 for o in market.outcomes:
                     if o.token_id in live_prices:
                         o.price = live_prices[o.token_id]
+                        n_live += 1
+            if n_live > 0:
+                price_source = "live"
+                log.info(
+                    "Polymarket: %d/%d prices refreshed from CLOB (live)",
+                    n_live, n_total,
+                )
+            else:
+                log.warning(
+                    "Polymarket: CLOB returned 0 live prices – using Gamma snapshot (may be stale)"
+                )
             log.info(
                 "Polymarket: found %s with %d outcomes (vol $%.0f)",
                 market.title, len(market.outcomes), market.volume,
@@ -321,6 +335,9 @@ def _run_polymarket_analysis(
         providers=providers,
         market=market,
     )
+    # Propagate price source to hedging strategy
+    if betting.hedging is not None:
+        betting.hedging.price_source = price_source
     print(polymarket_format(betting))
 
 

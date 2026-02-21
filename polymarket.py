@@ -58,6 +58,7 @@ class HedgingStrategy:
     expected_value: float        # EV = prob × profit + (1-prob) × loss
     market_url: str | None = None
     market_volume: float | None = None
+    price_source: str = "snapshot"  # "live" or "snapshot"
 
 
 @dataclass
@@ -435,6 +436,10 @@ def format_analysis(analysis: BettingAnalysis) -> str:
             vol_str = f"${h.market_volume:,.0f}" if h.market_volume else "N/A"
             lines.append(f"  Market : {h.market_url}")
             lines.append(f"  Volume : {vol_str}")
+        if h.price_source == "live":
+            lines.append(f"  Prices : LIVE (CLOB order book)")
+        else:
+            lines.append(f"  Prices : ⚠ SNAPSHOT (Gamma API – may be stale)")
 
         lines.append("")
         lines.append(f"  {'Range':<16} {'Price':>6} {'Model':>6} {'Stake':>7} {'Shares':>7}")

@@ -471,15 +471,19 @@ def fetch_live_prices(
             resp.raise_for_status()
 
             data = resp.json()
+            log.debug("CLOB batch response keys: %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
             for tid in token_ids:
                 entry = data.get(tid)
                 if entry is None:
+                    log.debug("CLOB batch: no entry for token %s…%s", tid[:8], tid[-6:])
                     continue
                 # Response format: { "tid": { "BUY": "0.58" } }
                 if isinstance(entry, dict):
                     buy_price = entry.get("BUY") or entry.get("buy")
                     if buy_price is not None:
                         prices[tid] = float(buy_price)
+                    else:
+                        log.debug("CLOB batch: entry for %s…%s has no BUY key: %s", tid[:8], tid[-6:], entry)
                 # Could also be a direct string/float
                 elif isinstance(entry, (str, int, float)):
                     prices[tid] = float(entry)
@@ -490,6 +494,7 @@ def fetch_live_prices(
     # Fallback: individual GET requests for any missing tokens
     missing = [tid for tid in token_ids if tid not in prices]
     if missing:
+        log.info("CLOB batch missed %d/%d tokens, trying individual GET…", len(missing), len(token_ids))
         try:
             with httpx.Client(timeout=timeout) as client:
                 for tid in missing:
@@ -503,9 +508,12 @@ def fetch_live_prices(
                         # Response: { "price": "0.58" }
                         if "price" in data:
                             prices[tid] = float(data["price"])
+                        else:
+                            log.warning("CLOB GET /price for %s…%s: unexpected response: %s", tid[:8], tid[-6:], data)
                     except Exception as exc:
-                        log.debug("CLOB price for %s failed: %s", tid, exc)
+                        log.warning("CLOB price for %s…%s failed: %s", tid[:8], tid[-6:], exc)
         except Exception as exc:
             log.warning("CLOB individual price fetch failed: %s", exc)
 
+    log.info("CLOB prices: fetched %d/%d live prices", len(prices), len(token_ids))
     return prices
