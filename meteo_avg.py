@@ -300,6 +300,9 @@ def _run_polymarket_analysis(
     try:
         market = search_temperature_market(city_short, date)
         if market and market.outcomes:
+            # Save Gamma snapshot prices for comparison
+            gamma_prices = {o.token_id: o.price for o in market.outcomes if o.token_id}
+
             # Refresh with live CLOB prices
             live_prices = fetch_live_prices(market)
             n_total = len([o for o in market.outcomes if o.token_id])
@@ -309,20 +312,24 @@ def _run_polymarket_analysis(
                     if o.token_id in live_prices:
                         o.price = live_prices[o.token_id]
                         n_live += 1
+
+            # Print diagnostic comparison: Gamma snapshot vs CLOB
+            print(f"\n  --- Price source diagnostic ---")
+            print(f"  {'Outcome':<18} {'Gamma':>7} {'CLOB':>7} {'Δ':>7}")
+            for o in market.outcomes:
+                gp = gamma_prices.get(o.token_id, 0)
+                cp = live_prices.get(o.token_id, 0) if live_prices else 0
+                delta = (cp - gp) * 100 if cp > 0 else 0
+                src = "CLOB" if o.token_id in (live_prices or {}) else "Gamma"
+                print(f"  {o.label:<18} {gp*100:>6.1f}¢ {cp*100:>6.1f}¢ {delta:>+6.1f}¢ [{src}]")
+            print()
+
             if n_live > 0:
                 price_source = "live"
-                log.info(
-                    "Polymarket: %d/%d prices refreshed from CLOB (live)",
-                    n_live, n_total,
-                )
             else:
                 log.warning(
                     "Polymarket: CLOB returned 0 live prices – using Gamma snapshot (may be stale)"
                 )
-            log.info(
-                "Polymarket: found %s with %d outcomes (vol $%.0f)",
-                market.title, len(market.outcomes), market.volume,
-            )
     except Exception as exc:
         log.warning("Polymarket market fetch: %s", exc)
         market = None

@@ -88,11 +88,12 @@ def _city_matches(title: str, city: str) -> bool:
     if city_lower in title_lower:
         return True
 
-    # Common aliases
+    # Common aliases: map any known city variant → search names in title
     aliases = {
         "new york": ["new york", "nyc", "new-york"],
         "los angeles": ["los angeles", "la", "los-angeles"],
         "london": ["london"],
+        "greater london": ["london"],
         "paris": ["paris"],
     }
     for canonical, names in aliases.items():
@@ -172,7 +173,14 @@ def search_temperature_market(
     Uses the Gamma public-search endpoint. Returns None if no match found.
     """
     date_str = _format_date_search_safe(date)
-    query = f"highest temperature {city} {date_str}"
+
+    # Normalize city for search: "Greater London" → "London"
+    _search_aliases = {
+        "greater london": "London",
+    }
+    search_city = _search_aliases.get(city.lower().strip(), city)
+
+    query = f"highest temperature {search_city} {date_str}"
 
     try:
         with httpx.Client(timeout=timeout) as client:
@@ -463,30 +471,31 @@ def fetch_live_prices(
 
     prices: dict[str, float] = {}
 
+    # Strategy: try batch POST first, then individual GET for any missing.
+    # Individual GET /price?side=BUY is documented as most reliable.
+    batch_count = 0
+
     try:
-        # Batch POST endpoint: side must be uppercase "BUY"
         payload = [{"token_id": tid, "side": "BUY"} for tid in token_ids]
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(f"{CLOB_URL}/prices", json=payload)
             resp.raise_for_status()
 
             data = resp.json()
-            log.debug("CLOB batch response keys: %s", list(data.keys()) if isinstance(data, dict) else type(data).__name__)
-            for tid in token_ids:
-                entry = data.get(tid)
-                if entry is None:
-                    log.debug("CLOB batch: no entry for token %s…%s", tid[:8], tid[-6:])
-                    continue
-                # Response format: { "tid": { "BUY": "0.58" } }
-                if isinstance(entry, dict):
-                    buy_price = entry.get("BUY") or entry.get("buy")
-                    if buy_price is not None:
-                        prices[tid] = float(buy_price)
-                    else:
-                        log.debug("CLOB batch: entry for %s…%s has no BUY key: %s", tid[:8], tid[-6:], entry)
-                # Could also be a direct string/float
-                elif isinstance(entry, (str, int, float)):
-                    prices[tid] = float(entry)
+            if isinstance(data, dict):
+                for tid in token_ids:
+                    entry = data.get(tid)
+                    if entry is None:
+                        continue
+                    if isinstance(entry, dict):
+                        buy_price = entry.get("BUY") or entry.get("buy")
+                        if buy_price is not None:
+                            prices[tid] = float(buy_price)
+                            batch_count += 1
+                    elif isinstance(entry, (str, int, float)):
+                        prices[tid] = float(entry)
+                        batch_count += 1
+            log.warning("CLOB batch: got %d/%d prices", batch_count, len(token_ids))
 
     except Exception as exc:
         log.warning("CLOB batch price fetch failed: %s", exc)
@@ -494,7 +503,7 @@ def fetch_live_prices(
     # Fallback: individual GET requests for any missing tokens
     missing = [tid for tid in token_ids if tid not in prices]
     if missing:
-        log.info("CLOB batch missed %d/%d tokens, trying individual GET…", len(missing), len(token_ids))
+        log.warning("CLOB: %d tokens missing from batch, trying individual GET…", len(missing))
         try:
             with httpx.Client(timeout=timeout) as client:
                 for tid in missing:
@@ -505,7 +514,6 @@ def fetch_live_prices(
                         )
                         resp.raise_for_status()
                         data = resp.json()
-                        # Response: { "price": "0.58" }
                         if "price" in data:
                             prices[tid] = float(data["price"])
                         else:
@@ -515,5 +523,6 @@ def fetch_live_prices(
         except Exception as exc:
             log.warning("CLOB individual price fetch failed: %s", exc)
 
-    log.info("CLOB prices: fetched %d/%d live prices", len(prices), len(token_ids))
+    log.warning("CLOB prices: total %d/%d live (batch=%d, GET=%d)",
+                len(prices), len(token_ids), batch_count, len(prices) - batch_count)
     return prices
