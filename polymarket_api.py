@@ -520,6 +520,11 @@ def fetch_live_prices(
                             prices[tid] = float(data["price"])
                         else:
                             log.warning("CLOB GET /price for %s…%s: unexpected response: %s", tid[:8], tid[-6:], data)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 404:
+                            log.debug("CLOB price for %s…%s: no order book (404)", tid[:8], tid[-6:])
+                        else:
+                            log.warning("CLOB price for %s…%s failed: %s", tid[:8], tid[-6:], exc)
                     except Exception as exc:
                         log.warning("CLOB price for %s…%s failed: %s", tid[:8], tid[-6:], exc)
         except Exception as exc:
