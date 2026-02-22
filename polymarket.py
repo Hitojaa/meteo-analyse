@@ -421,7 +421,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
     h = analysis.hedging
 
     if h is not None and h.bets:
-        # Market data available: show price comparison table
+        # Market data available: show price table for context
         if h.market_url:
             lines.append(f"  Market : {h.market_url}")
             if h.market_volume:
@@ -432,78 +432,43 @@ def format_analysis(analysis: BettingAnalysis) -> str:
             lines.append(f"  Prices : ⚠ SNAPSHOT (Gamma API – may be stale)")
 
         lines.append("")
-        lines.append(f"  {'Range':<16} {'Model':>6} {'Price':>7} {'Edge':>7}")
-        lines.append(f"  {'─' * 42}")
+        lines.append(f"  {'Range':<16} {'Model':>6} {'Price':>7}")
+        lines.append(f"  {'─' * 32}")
 
         for bet in h.bets:
             model_str = f"{bet.model_prob * 100:>5.1f}%"
             if bet.market_price > 0:
                 price_str = f"{bet.market_price * 100:>5.1f}¢"
-                edge_str = f"{bet.edge * 100:>+5.1f}¢"
-                if bet.edge >= 0.05:
-                    verdict = "  ★ BUY"
-                elif bet.edge >= 0.02:
-                    verdict = "  ★"
-                elif bet.edge < -0.10:
-                    verdict = "  ✗"
-                else:
-                    verdict = ""
             else:
                 price_str = f"{'—':>7}"
-                edge_str = f"{'—':>7}"
-                verdict = ""
+            lines.append(f"  {bet.label:<16} {model_str} {price_str}")
 
-            lines.append(
-                f"  {bet.label:<16} {model_str} {price_str} {edge_str}{verdict}"
-            )
-
-        lines.append(f"  {'─' * 42}")
-        lines.append(f"  ★ = value  |  ✗ = overpriced")
+        lines.append(f"  {'─' * 32}")
         lines.append("")
 
-        # Recommendation text
-        value_bets = sorted(
-            [b for b in h.bets if b.edge >= 0.02 and b.market_price > 0],
-            key=lambda b: b.model_prob, reverse=True,
-        )
-        if value_bets:
-            bv = value_bets[0]
-            lines.append(f"  → BUY \"{bv.label}\""
-                         f" — model {bv.model_prob * 100:.0f}%"
-                         f" vs market {bv.market_price * 100:.0f}¢")
-            others = [b for b in value_bets[1:] if b.model_prob >= 0.05][:2]
-            if others:
-                o_str = ", ".join(
-                    f'"{b.label}" ({b.model_prob * 100:.0f}%'
-                    f' at {b.market_price * 100:.0f}¢)' for b in others
-                )
-                lines.append(f"  → Also consider: {o_str}")
-        else:
-            # No value bets — recommend model's top pick with market context
-            best_pct = best.prob * 100
-            lines.append(f"  → BUY \"{best.label}\""
-                         f" — our model gives {best_pct:.1f}% probability")
-            best_bet = next((b for b in h.bets if b.label == best.label), None)
-            if best_bet and best_bet.market_price > 0 and best_bet.edge < -0.10:
-                lines.append(f"    ⚠ Market asks {best_bet.market_price * 100:.0f}¢"
-                             f" — overpriced, wait for better price")
-            elif best_bet and best_bet.market_price > 0:
-                lines.append(f"    Market: {best_bet.market_price * 100:.0f}¢"
-                             f" (fair value: {best_pct:.0f}¢)")
-            else:
-                lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
-            if len(sorted_bins) > 1:
-                second = sorted_bins[1]
-                lines.append(f"  → Also consider: \"{second.label}\" ({second.prob * 100:.1f}%)")
+    # Recommendation — always based on model probability
+    best_pct = best.prob * 100
+    best_bet = None
+    if h is not None:
+        best_bet = next((b for b in h.bets if b.label == best.label), None)
 
+    if best_bet and best_bet.market_price > 0:
+        lines.append(f"  → BUY \"{best.label}\""
+                     f" — our model gives {best_pct:.1f}% (market: {best_bet.market_price * 100:.0f}¢)")
     else:
-        # No market data at all
-        best_pct = best.prob * 100
         lines.append(f"  → BUY \"{best.label}\" — our model gives {best_pct:.1f}% probability")
-        lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
+        if not best_bet:
+            lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
 
-        if len(sorted_bins) > 1:
-            second = sorted_bins[1]
+    if len(sorted_bins) > 1:
+        second = sorted_bins[1]
+        sec_bet = None
+        if h is not None:
+            sec_bet = next((b for b in h.bets if b.label == second.label), None)
+        if sec_bet and sec_bet.market_price > 0:
+            lines.append(f"  → Also consider: \"{second.label}\""
+                         f" ({second.prob * 100:.1f}%, market: {sec_bet.market_price * 100:.0f}¢)")
+        else:
             lines.append(f"  → Also consider: \"{second.label}\" ({second.prob * 100:.1f}%)")
 
     # Risk assessment
