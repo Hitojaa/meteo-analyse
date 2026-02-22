@@ -460,16 +460,31 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         if not best_bet:
             lines.append(f"    If Polymarket price < {best_pct:.0f}¢, this is a VALUE BET")
 
+    # "Also consider" — pick the next-best tradeable outcome
     if len(sorted_bins) > 1:
-        second = sorted_bins[1]
-        sec_bet = None
-        if h is not None:
-            sec_bet = next((b for b in h.bets if b.label == second.label), None)
-        if sec_bet and sec_bet.market_price > 0:
-            lines.append(f"  → Also consider: \"{second.label}\""
-                         f" ({second.prob * 100:.1f}%, market: {sec_bet.market_price * 100:.0f}¢)")
-        else:
-            lines.append(f"  → Also consider: \"{second.label}\" ({second.prob * 100:.1f}%)")
+        alt = None
+        for cand in sorted_bins[1:]:
+            if cand.label == best.label:
+                continue
+            if h is not None:
+                cand_bet = next((b for b in h.bets if b.label == cand.label), None)
+                if cand_bet and cand_bet.market_price > 0:
+                    alt = (cand, cand_bet)
+                    break
+                # No market data for this candidate — skip if market exists
+                if cand_bet and cand_bet.market_price == 0:
+                    continue
+            # No market at all — pick by model probability
+            alt = (cand, None)
+            break
+
+        if alt:
+            alt_bin, alt_bet = alt
+            if alt_bet and alt_bet.market_price > 0:
+                lines.append(f"  → Also consider: \"{alt_bin.label}\""
+                             f" ({alt_bin.prob * 100:.1f}%, market: {alt_bet.market_price * 100:.0f}¢)")
+            else:
+                lines.append(f"  → Also consider: \"{alt_bin.label}\" ({alt_bin.prob * 100:.1f}%)")
 
     # Risk assessment
     lines.append("")
