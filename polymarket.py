@@ -531,53 +531,47 @@ def format_analysis(analysis: BettingAnalysis) -> str:
 
         total_kelly = sum(k[3] for k in kelly)
 
-        if total_kelly > 0:
-            # At least one outcome has positive edge
+        # Warn if no positive edge
+        has_edge = total_kelly > 0
+        if not has_edge:
             lines.append("")
-            for label, p, c, f, edge in kelly:
-                if total_kelly > 0:
-                    alloc = bankroll * f / total_kelly
-                else:
-                    alloc = 0.0
-                shares = alloc / c if c > 0 else 0.0
-                payout = shares * 1.0  # $1 per share if wins
-                profit = payout - bankroll
-                edge_pct = edge * 100
+            lines.append(f"  ⚠ Both outcomes are overpriced by the market — negative EV")
 
-                if alloc < 0.01:
-                    lines.append(f"  {label:<10}  —  skip (no edge)")
-                else:
-                    lines.append(
-                        f"  {label:<10}  ${alloc:>5.2f}  →  "
-                        f"{shares:.1f} shares @ {c * 100:.0f}¢"
-                        f"  →  ${payout:.2f} if wins (net {'+' if profit >= 0 else ''}{profit:.2f})"
-                    )
-
-            # Expected value summary
-            lines.append("")
-            ev = 0.0
-            for label, p, c, f, edge in kelly:
-                alloc = bankroll * f / total_kelly if total_kelly > 0 else 0.0
-                shares = alloc / c if c > 0 else 0.0
-                ev += p * shares  # expected return from this outcome
-            # Subtract the cost (total bankroll spent)
-            total_spent = sum(
-                bankroll * k[3] / total_kelly for k in kelly if k[3] > 0
-            )
-            ev_profit = ev - total_spent
-            roi = (ev_profit / total_spent * 100) if total_spent > 0 else 0
-            lines.append(f"  Expected profit: {'+' if ev_profit >= 0 else ''}"
-                         f"${ev_profit:.2f} (ROI {'+' if roi >= 0 else ''}{roi:.0f}%)")
+        # Allocation: use Kelly fractions if edge exists,
+        # otherwise fall back to model-probability weighting
+        if has_edge:
+            weights = [k[3] for k in kelly]  # Kelly fractions
         else:
-            # Both outcomes overpriced by market
-            lines.append("")
-            lines.append(f"  ⚠ Both outcomes are overpriced by the market:")
-            for label, p, c, f, edge in kelly:
+            weights = [k[1] for k in kelly]  # model probabilities
+        total_w = sum(weights)
+
+        lines.append("")
+        for i, (label, p, c, f, edge) in enumerate(kelly):
+            alloc = bankroll * weights[i] / total_w if total_w > 0 else 0.0
+            shares = alloc / c if c > 0 else 0.0
+            payout = shares * 1.0  # $1 per share if wins
+            profit = payout - bankroll
+
+            if alloc < 0.01:
+                lines.append(f"  {label:<10}  —  skip (no edge)")
+            else:
                 lines.append(
-                    f"    {label:<10}  model {p * 100:.1f}%  vs  market {c * 100:.0f}¢"
-                    f"  (edge {edge * 100:+.1f}¢)"
+                    f"  {label:<10}  ${alloc:>5.2f}  →  "
+                    f"{shares:.1f} shares @ {c * 100:.0f}¢"
+                    f"  →  ${payout:.2f} if wins (net {'+' if profit >= 0 else ''}{profit:.2f})"
                 )
-            lines.append(f"  → No value bet detected — consider waiting or skipping")
+
+        # Expected value summary
+        lines.append("")
+        ev = 0.0
+        for i, (label, p, c, f, edge) in enumerate(kelly):
+            alloc = bankroll * weights[i] / total_w if total_w > 0 else 0.0
+            shares = alloc / c if c > 0 else 0.0
+            ev += p * shares
+        ev_profit = ev - bankroll
+        roi = (ev_profit / bankroll * 100)
+        lines.append(f"  Expected profit: {'+' if ev_profit >= 0 else ''}"
+                     f"${ev_profit:.2f} (ROI {'+' if roi >= 0 else ''}{roi:.0f}%)")
 
     lines.append(f"  {'=' * W}")
     lines.append("")
