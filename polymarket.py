@@ -504,7 +504,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         direction = "higher" if analysis.skewness > 0 else "lower"
         lines.append(f"  → Skew alert: some models lean {direction} than consensus")
 
-    # --- $10 allocation strategy (Kelly criterion) ---
+    # --- $10 allocation strategy ---
     # Collect the top-2 tradeable outcomes by model probability
     bankroll = 10.0
     picks: list[tuple] = []  # (label, model_prob, market_price)
@@ -517,61 +517,45 @@ def format_analysis(analysis: BettingAnalysis) -> str:
                 picks.append((cand.label, cand.prob, cand_bet.market_price))
 
     if len(picks) >= 2:
+        c1, c2 = picks[0][2], picks[1][2]
+        sum_prices = c1 + c2
+        combined_prob = picks[0][1] + picks[1][1]
+
         lines.append("")
         lines.append(f"  {'─' * W}")
-        lines.append(f"  $10 ALLOCATION (Kelly criterion)")
+        lines.append(f"  $10 ALLOCATION")
         lines.append(f"  {'─' * W}")
 
-        # Kelly fraction for each: f = (p - c) / (1 - c)
-        kelly = []
+        # Allocate proportionally to price → equalizes payout on both
+        # shares = bankroll / sum_prices (same for both outcomes)
+        shares = bankroll / sum_prices
+        profit_if_wins = shares - bankroll  # payout ($1/share) minus cost
+
+        lines.append("")
         for label, p, c in picks:
-            edge = p - c
-            f = max(0.0, edge / (1 - c)) if c < 1 else 0.0
-            kelly.append((label, p, c, f, edge))
+            alloc = bankroll * c / sum_prices
+            lines.append(
+                f"  {label:<10}  ${alloc:>5.2f}  →  "
+                f"{shares:.1f} shares @ {c * 100:.0f}¢"
+            )
 
-        total_kelly = sum(k[3] for k in kelly)
-
-        # Warn if no positive edge
-        has_edge = total_kelly > 0
-        if not has_edge:
-            lines.append("")
-            lines.append(f"  ⚠ Both outcomes are overpriced by the market — negative EV")
-
-        # Allocation: use Kelly fractions if edge exists,
-        # otherwise fall back to model-probability weighting
-        if has_edge:
-            weights = [k[3] for k in kelly]  # Kelly fractions
+        lines.append("")
+        if sum_prices < 1.0:
+            roi_win = (profit_if_wins / bankroll) * 100
+            lines.append(f"  If either wins  →  ${shares:.2f}  "
+                         f"(+${profit_if_wins:.2f}, ROI {roi_win:+.0f}%)")
         else:
-            weights = [k[1] for k in kelly]  # model probabilities
-        total_w = sum(weights)
+            lines.append(f"  If either wins  →  ${shares:.2f}  "
+                         f"(net {'+' if profit_if_wins >= 0 else ''}"
+                         f"${profit_if_wins:.2f})")
+        lines.append(f"  If neither wins →  -${bankroll:.2f}")
 
         lines.append("")
-        for i, (label, p, c, f, edge) in enumerate(kelly):
-            alloc = bankroll * weights[i] / total_w if total_w > 0 else 0.0
-            shares = alloc / c if c > 0 else 0.0
-            payout = shares * 1.0  # $1 per share if wins
-            profit = payout - bankroll
-
-            if alloc < 0.01:
-                lines.append(f"  {label:<10}  —  skip (no edge)")
-            else:
-                lines.append(
-                    f"  {label:<10}  ${alloc:>5.2f}  →  "
-                    f"{shares:.1f} shares @ {c * 100:.0f}¢"
-                    f"  →  ${payout:.2f} if wins (net {'+' if profit >= 0 else ''}{profit:.2f})"
-                )
-
-        # Expected value summary
-        lines.append("")
-        ev = 0.0
-        for i, (label, p, c, f, edge) in enumerate(kelly):
-            alloc = bankroll * weights[i] / total_w if total_w > 0 else 0.0
-            shares = alloc / c if c > 0 else 0.0
-            ev += p * shares
-        ev_profit = ev - bankroll
-        roi = (ev_profit / bankroll * 100)
-        lines.append(f"  Expected profit: {'+' if ev_profit >= 0 else ''}"
-                     f"${ev_profit:.2f} (ROI {'+' if roi >= 0 else ''}{roi:.0f}%)")
+        ev_profit = combined_prob * shares - bankroll
+        ev_roi = (ev_profit / bankroll) * 100
+        lines.append(f"  Combined prob: {combined_prob * 100:.0f}%"
+                     f"  |  Expected: {'+' if ev_profit >= 0 else ''}"
+                     f"${ev_profit:.2f} (ROI {ev_roi:+.0f}%)")
 
     lines.append(f"  {'=' * W}")
     lines.append("")
