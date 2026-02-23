@@ -290,8 +290,12 @@ def _run_polymarket_analysis(
     date: str,
     agg: AggregatedResult,
     providers: list[ProviderResult],
-) -> None:
-    """Print model-based betting analysis with optional live hedging strategy."""
+) -> tuple | None:
+    """Print model-based betting analysis with optional live hedging strategy.
+
+    Returns (market, betting, picks) tuple for use by --buy, or None.
+    picks is a list of dicts with keys: label, token_id, price, size, alloc.
+    """
     city_short = loc.display_name.split(",")[0].strip()
 
     # Try to fetch live Polymarket market data for hedging
@@ -347,6 +351,59 @@ def _run_polymarket_analysis(
         betting.hedging.price_source = price_source
     print(polymarket_format(betting))
 
+    # Build picks for --buy: extract the top-2 tradeable outcomes
+    picks = _extract_buy_picks(betting, market)
+    return market, betting, picks
+
+
+def _extract_buy_picks(betting, market) -> list[dict]:
+    """Extract the top-2 tradeable picks from a BettingAnalysis.
+
+    Returns a list of dicts: [{label, token_id, price, size, alloc}, ...]
+    matching the $10 ALLOCATION logic in polymarket.format_analysis.
+    """
+    h = betting.hedging
+    if h is None or not h.bets or market is None:
+        return []
+
+    sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
+    bankroll = 10.0
+
+    # Collect top-2 tradeable outcomes by model probability
+    raw_picks = []
+    for cand in sorted_bins:
+        if len(raw_picks) >= 2:
+            break
+        cand_bet = next((b for b in h.bets if b.label == cand.label), None)
+        if cand_bet and cand_bet.market_price > 0:
+            raw_picks.append((cand.label, cand.prob, cand_bet.market_price))
+
+    if len(raw_picks) < 2:
+        return []
+
+    c1, c2 = raw_picks[0][2], raw_picks[1][2]
+    sum_prices = c1 + c2
+    shares = bankroll / sum_prices
+
+    picks = []
+    for label, prob, price in raw_picks:
+        alloc = bankroll * price / sum_prices
+        # Find token_id from market outcomes
+        token_id = ""
+        for o in market.outcomes:
+            if o.label == label and o.token_id:
+                token_id = o.token_id
+                break
+        picks.append({
+            "label": label,
+            "token_id": token_id,
+            "price": price,
+            "size": round(shares, 1),
+            "alloc": round(alloc, 2),
+        })
+
+    return picks
+
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
@@ -382,6 +439,12 @@ def main(argv: list[str] | None = None) -> None:
         dest="no_polymarket",
         help="Skip Polymarket betting analysis section",
     )
+    parser.add_argument(
+        "--buy",
+        action="store_true",
+        dest="buy",
+        help="After analysis, prompt to place orders on Polymarket",
+    )
     args = parser.parse_args(argv)
 
     # --- Geocode ---
@@ -404,11 +467,17 @@ def main(argv: list[str] | None = None) -> None:
             _print_table(report)
 
             # Polymarket analysis (also from cache)
+            picks = []
             if not args.no_polymarket:
                 try:
-                    _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider)
+                    result = _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider)
+                    if result:
+                        _, _, picks = result
                 except Exception as exc:
                     log.warning("Polymarket analysis: %s", exc)
+
+            if args.buy:
+                _prompt_and_buy(picks)
         return
 
     # --- Self-learning: verify past predictions & load accuracy ---
@@ -466,11 +535,78 @@ def main(argv: list[str] | None = None) -> None:
         _print_table(report, provider_accuracy=provider_accuracy)
 
         # --- Polymarket betting analysis ---
+        picks = []
         if not args.no_polymarket:
             try:
-                _run_polymarket_analysis(loc, date, report.aggregated, results)
+                result = _run_polymarket_analysis(loc, date, report.aggregated, results)
+                if result:
+                    _, _, picks = result
             except Exception as exc:
                 log.warning("Polymarket analysis: %s", exc)
+
+        if args.buy:
+            _prompt_and_buy(picks)
+
+
+def _prompt_and_buy(picks: list[dict]) -> None:
+    """Ask for confirmation and place orders on Polymarket."""
+    if not picks:
+        print("\n  No tradeable picks found — nothing to buy.")
+        return
+
+    # Check for missing token_ids
+    missing = [p for p in picks if not p.get("token_id")]
+    if missing:
+        print("\n  Cannot place orders: missing token IDs for:")
+        for p in missing:
+            print(f"    - {p['label']}")
+        print("  (Market outcomes did not match model bins)")
+        return
+
+    print()
+    print("  " + "=" * 50)
+    print("  ORDER CONFIRMATION")
+    print("  " + "=" * 50)
+    total = sum(p["alloc"] for p in picks)
+    for p in picks:
+        print(f"  BUY {p['label']:<10}  {p['size']:.1f} shares @ {p['price'] * 100:.0f}¢"
+              f"  (${p['alloc']:.2f})")
+    print(f"  {'─' * 50}")
+    print(f"  Total cost: ${total:.2f}")
+    print()
+
+    try:
+        answer = input("  Place these orders? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        return
+
+    if answer not in ("y", "yes", "oui", "o"):
+        print("  Cancelled.")
+        return
+
+    print()
+    print("  Placing orders...")
+
+    try:
+        from polymarket_buy import place_orders
+        results = place_orders(picks)
+    except RuntimeError as exc:
+        print(f"\n  Error: {exc}", file=sys.stderr)
+        return
+    except Exception as exc:
+        print(f"\n  Unexpected error: {exc}", file=sys.stderr)
+        return
+
+    print()
+    for r in results:
+        if r.success:
+            print(f"  {r.label:<10}  OK — order {r.order_id}")
+        else:
+            print(f"  {r.label:<10}  FAILED — {r.error}")
+
+    ok = sum(1 for r in results if r.success)
+    print(f"\n  {ok}/{len(results)} orders placed successfully.")
 
 
 def _rebuild_report_from_cache(data: dict) -> ForecastReport:
