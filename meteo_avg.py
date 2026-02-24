@@ -290,6 +290,7 @@ def _run_polymarket_analysis(
     date: str,
     agg: AggregatedResult,
     providers: list[ProviderResult],
+    budget: float = 10.0,
 ) -> tuple | None:
     """Print model-based betting analysis with optional live hedging strategy.
 
@@ -345,6 +346,7 @@ def _run_polymarket_analysis(
         agg=agg,
         providers=providers,
         market=market,
+        budget=budget,
     )
     # Propagate price source to hedging strategy
     if betting.hedging is not None:
@@ -352,22 +354,22 @@ def _run_polymarket_analysis(
     print(polymarket_format(betting))
 
     # Build picks for --buy: extract the top-2 tradeable outcomes
-    picks = _extract_buy_picks(betting, market)
+    picks = _extract_buy_picks(betting, market, budget)
     return market, betting, picks
 
 
-def _extract_buy_picks(betting, market) -> list[dict]:
+def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     """Extract the top-2 tradeable picks from a BettingAnalysis.
 
     Returns a list of dicts: [{label, token_id, price, size, alloc}, ...]
-    matching the $10 ALLOCATION logic in polymarket.format_analysis.
+    matching the ALLOCATION logic in polymarket.format_analysis.
     """
     h = betting.hedging
     if h is None or not h.bets or market is None:
         return []
 
     sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
-    bankroll = 10.0
+    bankroll = budget
 
     # Collect top-2 tradeable outcomes by model probability
     raw_picks = []
@@ -440,6 +442,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip Polymarket betting analysis section",
     )
     parser.add_argument(
+        "--budget",
+        type=float,
+        default=10.0,
+        dest="budget",
+        help="Budget in $ for Polymarket betting allocation (default: 10)",
+    )
+    parser.add_argument(
         "--buy",
         action="store_true",
         dest="buy",
@@ -470,7 +479,7 @@ def main(argv: list[str] | None = None) -> None:
             picks = []
             if not args.no_polymarket:
                 try:
-                    result = _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider)
+                    result = _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider, budget=args.budget)
                     if result:
                         _, _, picks = result
                 except Exception as exc:
@@ -538,7 +547,7 @@ def main(argv: list[str] | None = None) -> None:
         picks = []
         if not args.no_polymarket:
             try:
-                result = _run_polymarket_analysis(loc, date, report.aggregated, results)
+                result = _run_polymarket_analysis(loc, date, report.aggregated, results, budget=args.budget)
                 if result:
                     _, _, picks = result
             except Exception as exc:

@@ -72,6 +72,7 @@ class BettingAnalysis:
     bins: list[BettingBin]
     skewness: float
     confidence: float
+    budget: float = 10.0
     hedging: HedgingStrategy | None = None
 
 
@@ -303,6 +304,7 @@ def analyze(
         bins=bins,
         skewness=skew,
         confidence=agg.confidence,
+        budget=budget,
         hedging=hedging,
     )
 
@@ -504,9 +506,9 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         direction = "higher" if analysis.skewness > 0 else "lower"
         lines.append(f"  → Skew alert: some models lean {direction} than consensus")
 
-    # --- $10 allocation strategy ---
+    # --- Allocation strategy ---
     # Collect the top-2 tradeable outcomes by model probability
-    bankroll = 10.0
+    bankroll = analysis.budget
     picks: list[tuple] = []  # (label, model_prob, market_price)
     if h is not None and h.bets:
         for cand in sorted_bins:
@@ -523,7 +525,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
 
         lines.append("")
         lines.append(f"  {'─' * W}")
-        lines.append(f"  $10 ALLOCATION")
+        lines.append(f"  ${bankroll:.0f} ALLOCATION")
         lines.append(f"  {'─' * W}")
 
         # Allocate proportionally to price → equalizes payout on both
