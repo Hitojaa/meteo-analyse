@@ -508,6 +508,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
 
     # --- Allocation strategy ---
     # Collect the top-2 tradeable outcomes by model probability
+    # Skip outcomes priced below 5¢ — too cheap to be meaningful
     bankroll = analysis.budget
     picks: list[tuple] = []  # (label, model_prob, market_price)
     if h is not None and h.bets:
@@ -515,7 +516,7 @@ def format_analysis(analysis: BettingAnalysis) -> str:
             if len(picks) >= 2:
                 break
             cand_bet = next((b for b in h.bets if b.label == cand.label), None)
-            if cand_bet and cand_bet.market_price > 0:
+            if cand_bet and cand_bet.market_price >= 0.05:
                 picks.append((cand.label, cand.prob, cand_bet.market_price))
 
     if len(picks) >= 2:

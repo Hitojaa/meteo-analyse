@@ -377,12 +377,13 @@ def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     bankroll = budget
 
     # Collect top-2 tradeable outcomes by model probability
+    # Skip outcomes priced below 5¢ — too cheap to be meaningful
     raw_picks = []
     for cand in sorted_bins:
         if len(raw_picks) >= 2:
             break
         cand_bet = next((b for b in h.bets if b.label == cand.label), None)
-        if cand_bet and cand_bet.market_price > 0:
+        if cand_bet and cand_bet.market_price >= 0.05:
             raw_picks.append((cand.label, cand.prob, cand_bet.market_price))
 
     if len(raw_picks) < 2:
@@ -419,6 +420,10 @@ def _auto_scan(budget: float = 10.0) -> None:
     Displays the top 3 markets with the 2 best trades each.
     """
     import time
+    from datetime import timedelta
+
+    # Silence noisy provider warnings during scan
+    logging.getLogger().setLevel(logging.CRITICAL)
 
     print(f"\n{'=' * 72}")
     print("  AUTO SCAN — Searching all Polymarket temperature markets...")
@@ -455,6 +460,18 @@ def _auto_scan(budget: float = 10.0) -> None:
             continue
 
         city, date = parsed
+
+        # Skip markets too far in the future for reliable forecasts
+        try:
+            market_date = datetime.fromisoformat(date)
+            days_ahead = (market_date - datetime.now()).days
+            if days_ahead > 16:
+                continue
+            if days_ahead < 0:
+                continue
+        except ValueError:
+            continue
+
         print(f"  [{i+1}/{len(markets)}] {city} — {date} ...", end=" ", flush=True)
 
         # Geocode
@@ -514,13 +531,17 @@ def _auto_scan(budget: float = 10.0) -> None:
             print("no tradeable outcomes")
             continue
 
+        # Only consider outcomes with market price >= 5¢ (0.05)
+        # Anything below is noise / already resolved — inflates ROI artificially
+        MIN_PRICE = 0.05
+
         sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
         raw_picks = []
         for cand in sorted_bins:
             if len(raw_picks) >= 2:
                 break
             cand_bet = next((b for b in h.bets if b.label == cand.label), None)
-            if cand_bet and cand_bet.market_price > 0:
+            if cand_bet and cand_bet.market_price >= MIN_PRICE:
                 raw_picks.append((cand.label, cand.prob, cand_bet.market_price))
 
         if len(raw_picks) < 2:
