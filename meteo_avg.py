@@ -30,7 +30,12 @@ from models import (
     ProviderResult,
 )
 from polymarket import analyze as polymarket_analyze, format_analysis as polymarket_format
-from polymarket_api import search_temperature_market, fetch_live_prices
+from polymarket_api import (
+    search_temperature_market,
+    fetch_live_prices,
+    search_all_temperature_markets,
+    parse_market_title,
+)
 from providers import open_meteo, openweather, weatherapi
 from verification import ProviderAccuracy, save_forecast, verify_and_update
 
@@ -407,11 +412,202 @@ def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     return picks
 
 
+def _auto_scan(budget: float = 10.0) -> None:
+    """Scan all active Polymarket temperature markets and rank by ROI.
+
+    For each market: geocode city → fetch forecast → analyze → compute ROI.
+    Displays the top 3 markets with the 2 best trades each.
+    """
+    import time
+
+    print(f"\n{'=' * 72}")
+    print("  AUTO SCAN — Searching all Polymarket temperature markets...")
+    print(f"{'=' * 72}\n")
+
+    markets = search_all_temperature_markets()
+    if not markets:
+        print("  No active temperature markets found.")
+        return
+
+    print(f"  Found {len(markets)} active temperature market(s). Analyzing...\n")
+
+    # For each market, run the pipeline and collect results
+    # Each result: (market_title, city, date, roi, picks, market_url, volume)
+    from dataclasses import dataclass
+
+    @dataclass
+    class ScanResult:
+        title: str
+        city: str
+        date: str
+        market_url: str
+        volume: float
+        combined_prob: float
+        roi_pct: float
+        picks: list[dict]  # [{label, price, model_prob, alloc, shares}]
+
+    scan_results: list[ScanResult] = []
+
+    for i, market in enumerate(markets):
+        parsed = parse_market_title(market.title)
+        if not parsed:
+            log.warning("Could not parse title: %s", market.title)
+            continue
+
+        city, date = parsed
+        print(f"  [{i+1}/{len(markets)}] {city} — {date} ...", end=" ", flush=True)
+
+        # Geocode
+        try:
+            loc = geocode(city)
+        except Exception as exc:
+            print(f"geocode failed ({exc})")
+            continue
+
+        # Fetch forecast
+        try:
+            results, errors = _fetch_all(loc, date)
+        except Exception as exc:
+            print(f"forecast failed ({exc})")
+            continue
+
+        if not results:
+            print("no forecast data")
+            continue
+
+        # Aggregate
+        try:
+            agg = aggregate(results)
+        except Exception as exc:
+            print(f"aggregate failed ({exc})")
+            continue
+
+        # Refresh market with live prices
+        try:
+            live_prices = fetch_live_prices(market)
+            if live_prices:
+                for o in market.outcomes:
+                    if o.token_id in live_prices:
+                        o.price = live_prices[o.token_id]
+        except Exception:
+            pass
+
+        # Betting analysis
+        city_short = loc.display_name.split(",")[0].strip()
+        try:
+            betting = polymarket_analyze(
+                city=city_short,
+                date=date,
+                country=loc.country,
+                agg=agg,
+                providers=results,
+                market=market,
+                budget=budget,
+            )
+        except Exception as exc:
+            print(f"analysis failed ({exc})")
+            continue
+
+        # Extract top-2 tradeable picks with ROI
+        h = betting.hedging
+        if not h or not h.bets:
+            print("no tradeable outcomes")
+            continue
+
+        sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
+        raw_picks = []
+        for cand in sorted_bins:
+            if len(raw_picks) >= 2:
+                break
+            cand_bet = next((b for b in h.bets if b.label == cand.label), None)
+            if cand_bet and cand_bet.market_price > 0:
+                raw_picks.append((cand.label, cand.prob, cand_bet.market_price))
+
+        if len(raw_picks) < 2:
+            print("not enough tradeable outcomes")
+            continue
+
+        c1, c2 = raw_picks[0][2], raw_picks[1][2]
+        sum_prices = c1 + c2
+        combined_prob = raw_picks[0][1] + raw_picks[1][1]
+        shares = budget / sum_prices
+        ev_profit = combined_prob * shares - budget
+        roi_pct = (ev_profit / budget) * 100
+
+        picks = []
+        for label, prob, price in raw_picks:
+            alloc = budget * price / sum_prices
+            picks.append({
+                "label": label,
+                "model_prob": prob,
+                "price": price,
+                "alloc": round(alloc, 2),
+                "shares": round(shares, 1),
+            })
+
+        scan_results.append(ScanResult(
+            title=market.title,
+            city=city_short,
+            date=date,
+            market_url=market.url,
+            volume=market.volume,
+            combined_prob=combined_prob,
+            roi_pct=roi_pct,
+            picks=picks,
+        ))
+
+        print(f"ROI {roi_pct:+.0f}%")
+
+        # Rate-limit to avoid hammering APIs
+        time.sleep(1)
+
+    if not scan_results:
+        print("\n  No tradeable markets found.")
+        return
+
+    # Rank by ROI descending, take top 3
+    scan_results.sort(key=lambda r: r.roi_pct, reverse=True)
+    top = scan_results[:3]
+
+    W = 72
+    print(f"\n{'=' * W}")
+    print(f"  TOP {len(top)} MARKETS BY ROI (budget: ${budget:.0f})")
+    print(f"{'=' * W}")
+
+    for rank, r in enumerate(top, 1):
+        print(f"\n  {'─' * W}")
+        print(f"  #{rank}  {r.city} — {r.date}")
+        print(f"       {r.market_url}")
+        if r.volume:
+            print(f"       Volume: ${r.volume:,.0f}")
+        print()
+
+        sum_prices = sum(p["price"] for p in r.picks)
+        shares = budget / sum_prices
+
+        for p in r.picks:
+            print(
+                f"       {p['label']:<12}  "
+                f"model {p['model_prob']*100:>5.1f}%  "
+                f"market {p['price']*100:>5.1f}¢  "
+                f"${p['alloc']:>5.2f}  →  {p['shares']:.1f} shares"
+            )
+
+        print()
+        print(f"       Combined prob: {r.combined_prob*100:.0f}%"
+              f"  |  ROI: {r.roi_pct:+.0f}%")
+        profit = r.combined_prob * shares - budget
+        print(f"       If either wins → ${shares:.2f} (+${profit:.2f})")
+        print(f"       If neither     → -${budget:.0f}")
+
+    print(f"\n{'=' * W}\n")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Intelligent multi-source weather forecast aggregation."
     )
-    parser.add_argument("city", help="City name (e.g. 'Paris', 'Lyon')")
+    parser.add_argument("city", nargs="?", default=None, help="City name (e.g. 'Paris', 'Lyon')")
     parser.add_argument(
         "--date",
         default=None,
@@ -454,7 +650,21 @@ def main(argv: list[str] | None = None) -> None:
         dest="buy",
         help="After analysis, prompt to place orders on Polymarket",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="auto_scan",
+        help="Scan ALL active temperature markets and show top 3 by ROI",
+    )
     args = parser.parse_args(argv)
+
+    # --- Auto scan mode ---
+    if args.auto_scan:
+        _auto_scan(budget=args.budget)
+        return
+
+    if not args.city:
+        parser.error("city is required (unless using --auto)")
 
     # --- Geocode ---
     try:

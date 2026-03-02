@@ -533,3 +533,155 @@ def fetch_live_prices(
     log.info("CLOB prices: total %d/%d live (batch=%d, GET=%d)",
              len(prices), len(token_ids), batch_count, len(prices) - batch_count)
     return prices
+
+
+# ---------------------------------------------------------------------------
+# Broad search: all active temperature markets
+# ---------------------------------------------------------------------------
+
+def search_all_temperature_markets(
+    timeout: float = 15.0,
+) -> list[TemperatureMarket]:
+    """Search Polymarket for ALL active temperature markets.
+
+    Returns a list of TemperatureMarket objects, one per event.
+    """
+    all_markets: list[TemperatureMarket] = []
+    seen_slugs: set[str] = set()
+
+    queries = ["highest temperature", "temperature celsius", "temperature fahrenheit"]
+
+    for query in queries:
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.get(
+                    f"{GAMMA_URL}/public-search",
+                    params={
+                        "q": query,
+                        "events_status": "active",
+                        "limit_per_type": 50,
+                    },
+                )
+                resp.raise_for_status()
+        except Exception as exc:
+            log.warning("Polymarket broad search failed for %r: %s", query, exc)
+            continue
+
+        data = resp.json()
+        events = data.get("events", [])
+
+        for event in events:
+            title = event.get("title", "")
+            slug = event.get("slug", "")
+
+            if "temperature" not in title.lower():
+                continue
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+
+            markets = event.get("markets", [])
+            if not markets:
+                continue
+
+            # Fetch full event for all sub-markets
+            if len(markets) <= 1 and slug:
+                full_markets = _fetch_event_markets(slug, timeout)
+                if full_markets and len(full_markets) > len(markets):
+                    markets = full_markets
+
+            description = event.get("description", "")
+            unit = _detect_unit(title, description)
+
+            if len(markets) > 1:
+                result = _parse_neg_risk_event(markets, title, slug, unit)
+                if result is not None:
+                    all_markets.append(result)
+                    continue
+
+            # Single market fallback
+            market = markets[0]
+            try:
+                outcomes_raw = json.loads(market.get("outcomes", "[]"))
+                prices_raw = json.loads(market.get("outcomePrices", "[]"))
+                token_ids_raw = json.loads(market.get("clobTokenIds", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+            if not outcomes_raw or not prices_raw:
+                continue
+
+            outcomes: list[MarketOutcome] = []
+            for i, label in enumerate(outcomes_raw):
+                price = float(prices_raw[i]) if i < len(prices_raw) else 0.0
+                tid = str(token_ids_raw[i]) if i < len(token_ids_raw) else ""
+                outcomes.append(MarketOutcome(
+                    label=str(label), price=price, token_id=tid,
+                ))
+
+            volume = float(market.get("volume", 0) or 0)
+            end_date = market.get("endDate")
+
+            all_markets.append(TemperatureMarket(
+                title=title,
+                slug=slug,
+                url=f"https://polymarket.com/event/{slug}",
+                volume=volume,
+                outcomes=outcomes,
+                unit=unit,
+                active=bool(market.get("active", False)),
+                end_date=end_date,
+            ))
+
+    log.info("Found %d active temperature markets", len(all_markets))
+    return all_markets
+
+
+def parse_market_title(title: str) -> tuple[str, str] | None:
+    """Extract (city, date_iso) from a market title.
+
+    Handles titles like:
+      "Will the highest temperature in London on March 2 be..."
+      "Highest temperature in New York City on February 28?"
+
+    Returns None if parsing fails.
+    """
+    # Pattern: "temperature in <CITY> on <MONTH> <DAY>"
+    m = re.search(
+        r"temperature\s+in\s+(.+?)\s+on\s+(\w+)\s+(\d{1,2})",
+        title,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+
+    city = m.group(1).strip()
+    month_str = m.group(2).strip()
+    day_str = m.group(3).strip()
+
+    # Parse month name → number
+    try:
+        month_dt = datetime.strptime(month_str, "%B")
+        month = month_dt.month
+    except ValueError:
+        try:
+            month_dt = datetime.strptime(month_str, "%b")
+            month = month_dt.month
+        except ValueError:
+            return None
+
+    day = int(day_str)
+
+    # Determine year: assume current or next year
+    now = datetime.now()
+    year = now.year
+    try:
+        date = datetime(year, month, day)
+        # If the date is more than 30 days in the past, it's next year
+        if (now - date).days > 30:
+            year += 1
+            date = datetime(year, month, day)
+    except ValueError:
+        return None
+
+    return city, date.strftime("%Y-%m-%d")
