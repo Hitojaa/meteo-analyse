@@ -219,6 +219,42 @@ def _confidence_score(
     return min(round(score * 100, 0), 99)  # Cap at 99 (never 100% certain)
 
 
+def _instability_factor(results: list[ProviderResult]) -> float:
+    """Compute an instability multiplier from weather conditions.
+
+    High wind, precipitation, or storm probability indicate volatile
+    conditions where temperature predictions are less reliable.
+    Returns a factor >= 1.0 that widens the uncertainty envelope.
+    """
+    # Collect instability data from any provider that has it
+    for r in results:
+        inst = getattr(r, "instability", None)
+        if inst:
+            break
+    else:
+        return 1.0
+
+    factor = 1.0
+
+    # High wind increases temperature unpredictability
+    wind = inst.get("wind_max_kmh")
+    gust = inst.get("wind_gust_kmh")
+    if gust and gust > 60:
+        factor += 0.15  # strong gusts → more uncertainty
+    elif wind and wind > 40:
+        factor += 0.08
+
+    # Precipitation events destabilize temperature forecasts
+    precip = inst.get("precip_mm")
+    precip_prob = inst.get("precip_prob_pct")
+    if precip and precip > 10:
+        factor += 0.12  # significant rain/snow
+    elif precip_prob and precip_prob > 70:
+        factor += 0.08
+
+    return factor
+
+
 def aggregate(
     results: list[ProviderResult],
     historical: HistoricalStats | None = None,
@@ -318,6 +354,9 @@ def aggregate(
     )
     confidence = min(conf_tmin, conf_tmax)
 
+    # Instability factor widens uncertainty
+    inst_factor = _instability_factor(valid)
+
     return AggregatedResult(
         tmin_c=round(agg_tmin, 1),
         tmax_c=round(agg_tmax, 1),
@@ -333,4 +372,5 @@ def aggregate(
         hist_tmin_std=hist_tmin_std,
         hist_tmax_std=hist_tmax_std,
         hist_sample_size=hist_sample_size,
+        instability_factor=inst_factor,
     )

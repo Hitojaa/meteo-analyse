@@ -3,6 +3,10 @@
 Docs: https://open-meteo.com/en/docs
 Queries multiple NWP models in a single request via the &models= parameter.
 Each model returns its own daily min/max, giving us many independent sources.
+
+Also fetches hourly temperature profiles for the best_match model to get
+a more precise tmax (max of hourly values), which better matches what
+weather stations actually record.
 """
 
 from __future__ import annotations
@@ -35,6 +39,9 @@ CORE_MODELS: dict[str, str] = {
 EXTRA_MODELS: dict[str, str] = {
     "knmi_seamless": "KNMI (Netherlands)",
     "dmi_seamless": "DMI (Denmark)",
+    "bom_access_global": "BOM ACCESS (Australia)",
+    "cma_grapes_global": "CMA GRAPES (China)",
+    "arpae_cosmo_seamless": "ARPAE COSMO (Italy)",
 }
 
 MODELS: dict[str, str] = {**CORE_MODELS, **EXTRA_MODELS}
@@ -63,13 +70,92 @@ def _query_models(
     return resp.json().get("daily", {})
 
 
+def _fetch_hourly_peak(
+    client: httpx.Client,
+    lat: float,
+    lon: float,
+    date: str,
+    timezone: str,
+) -> tuple[float | None, float | None]:
+    """Fetch hourly temperature profile and return (min, max).
+
+    The hourly max is typically more accurate than daily tmax for
+    predicting what a weather station will actually record, as it
+    captures the actual peak rather than a smoothed daily estimate.
+    """
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m",
+        "timezone": timezone,
+        "start_date": date,
+        "end_date": date,
+    }
+    try:
+        resp = client.get(BASE_URL, params=params)
+        resp.raise_for_status()
+        hourly = resp.json().get("hourly", {})
+        temps = hourly.get("temperature_2m", [])
+        valid = [t for t in temps if t is not None]
+        if valid:
+            return min(valid), max(valid)
+    except Exception as exc:
+        log.debug("Hourly fetch failed: %s", exc)
+    return None, None
+
+
+def _fetch_instability(
+    client: httpx.Client,
+    lat: float,
+    lon: float,
+    date: str,
+    timezone: str,
+) -> dict:
+    """Fetch weather instability indicators (wind, precipitation, cloud cover).
+
+    Returns a dict with instability metrics that can be used to widen
+    the uncertainty envelope when weather conditions are volatile.
+    """
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": (
+            "windspeed_10m_max,windgusts_10m_max,"
+            "precipitation_sum,precipitation_probability_max"
+        ),
+        "timezone": timezone,
+        "start_date": date,
+        "end_date": date,
+    }
+    result: dict = {}
+    try:
+        resp = client.get(BASE_URL, params=params)
+        resp.raise_for_status()
+        daily = resp.json().get("daily", {})
+
+        def _first(key: str) -> float | None:
+            vals = daily.get(key, [])
+            return vals[0] if vals and vals[0] is not None else None
+
+        result["wind_max_kmh"] = _first("windspeed_10m_max")
+        result["wind_gust_kmh"] = _first("windgusts_10m_max")
+        result["precip_mm"] = _first("precipitation_sum")
+        result["precip_prob_pct"] = _first("precipitation_probability_max")
+    except Exception as exc:
+        log.debug("Instability fetch failed: %s", exc)
+    return result
+
+
 def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResult]:
     """Fetch daily min/max from Open-Meteo for all available NWP models.
 
     Tries all models first; if the API rejects the request (e.g. an
     unsupported model name), falls back to core models only.
 
-    Returns one ProviderResult per model.
+    Also fetches hourly temperatures to add a more precise "hourly peak"
+    provider result, and instability data stored on the results.
+
+    Returns one ProviderResult per model, plus an hourly-peak result.
     """
     with httpx.Client(timeout=15) as client:
         try:
@@ -84,6 +170,14 @@ def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResu
                 active_models = CORE_MODELS
             else:
                 raise
+
+        # Fetch hourly peak temperature (more precise than daily tmax)
+        hourly_min, hourly_max = _fetch_hourly_peak(
+            client, lat, lon, date, timezone
+        )
+
+        # Fetch instability indicators
+        instability = _fetch_instability(client, lat, lon, date, timezone)
 
     results: list[ProviderResult] = []
     for model_id, label in active_models.items():
@@ -122,7 +216,24 @@ def fetch(lat: float, lon: float, date: str, timezone: str) -> list[ProviderResu
             )
         )
 
+    # Add hourly peak as an extra high-weight provider
+    if hourly_min is not None and hourly_max is not None:
+        results.append(
+            ProviderResult(
+                provider_name="Open-Meteo (Hourly Peak)",
+                tmin_c=round(hourly_min, 1),
+                tmax_c=round(hourly_max, 1),
+                date=date,
+                timezone=timezone,
+                quality=DataQuality.HOURLY_PEAK,
+            )
+        )
+
     if not results:
         raise RuntimeError("Open-Meteo returned no usable data for any model")
+
+    # Attach instability data to all results for downstream use
+    for r in results:
+        r.instability = instability
 
     return results

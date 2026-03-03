@@ -5,8 +5,12 @@ for each temperature range and recommend optimal bets.
 
 When a live Polymarket market is found, computes a value-betting
 strategy that targets mispriced outcomes where our model probability
-exceeds the market ask price.  Positions are sized using the Kelly
-criterion for optimal growth.
+exceeds the market ask price.
+
+Probability modeling uses Kernel Density Estimation (KDE) from the
+actual provider values when enough data points are available, falling
+back to Normal distribution otherwise. This captures asymmetric and
+bimodal distributions that a simple Normal cannot represent.
 
 Polymarket temperature markets resolve to the highest temperature
 recorded at a specific station, measured in whole degrees:
@@ -74,6 +78,7 @@ class BettingAnalysis:
     confidence: float
     budget: float = 10.0
     hedging: HedgingStrategy | None = None
+    max_picks: int = 2  # max outcomes in allocation
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +90,62 @@ def _normal_cdf(x: float, mu: float, sigma: float) -> float:
     if sigma <= 0:
         return 1.0 if x >= mu else 0.0
     return 0.5 * (1.0 + math.erf((x - mu) / (sigma * math.sqrt(2.0))))
+
+
+def _normal_pdf(x: float, mu: float, sigma: float) -> float:
+    """PDF of Normal(mu, sigma) evaluated at x."""
+    if sigma <= 0:
+        return float("inf") if x == mu else 0.0
+    return math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * math.sqrt(2.0 * math.pi))
+
+
+def _kde_pdf(x: float, samples: list[float], bandwidth: float) -> float:
+    """Kernel Density Estimation using Gaussian kernels.
+
+    Each sample contributes a Normal(sample, bandwidth) kernel.
+    The PDF at x is the average of all kernel values.
+    """
+    if not samples:
+        return 0.0
+    return sum(_normal_pdf(x, s, bandwidth) for s in samples) / len(samples)
+
+
+def _kde_cdf_numerical(
+    x: float, samples: list[float], bandwidth: float,
+    lo: float | None = None, n_steps: int = 200,
+) -> float:
+    """Numerically integrate KDE PDF from lo to x using the trapezoidal rule."""
+    if lo is None:
+        lo = min(samples) - 5 * bandwidth
+    if x <= lo:
+        return 0.0
+    step = (x - lo) / n_steps
+    total = 0.0
+    prev_y = _kde_pdf(lo, samples, bandwidth)
+    for i in range(1, n_steps + 1):
+        xi = lo + i * step
+        yi = _kde_pdf(xi, samples, bandwidth)
+        total += (prev_y + yi) * 0.5 * step
+        prev_y = yi
+    return min(max(total, 0.0), 1.0)
+
+
+def _silverman_bandwidth(samples: list[float]) -> float:
+    """Silverman's rule of thumb for KDE bandwidth selection."""
+    n = len(samples)
+    if n < 2:
+        return 1.0
+    mean_val = sum(samples) / n
+    std_val = (sum((x - mean_val) ** 2 for x in samples) / n) ** 0.5
+    if std_val == 0:
+        return 1.0
+    # Silverman's rule: h = 0.9 * min(std, IQR/1.34) * n^(-1/5)
+    sorted_s = sorted(samples)
+    q1 = sorted_s[n // 4]
+    q3 = sorted_s[3 * n // 4]
+    iqr = q3 - q1
+    spread = min(std_val, iqr / 1.34) if iqr > 0 else std_val
+    return 0.9 * spread * n ** (-0.2)
 
 
 def _c_to_f(c: float) -> float:
@@ -111,17 +172,30 @@ def _is_us(country: str) -> bool:
 
 def _prob_for_outcome(
     label: str, center: float, sigma: float,
+    kde_samples: list[float] | None = None,
+    kde_bw: float | None = None,
 ) -> float:
-    """Compute our model's probability for a Polymarket outcome label."""
+    """Compute our model's probability for a Polymarket outcome label.
+
+    Uses KDE if samples are provided (>= 5 points), otherwise falls
+    back to Normal(center, sigma).
+    """
     import re
     low = label.lower()
+
+    use_kde = kde_samples is not None and kde_bw is not None and len(kde_samples) >= 5
+
+    def _cdf(x: float) -> float:
+        if use_kde:
+            return _kde_cdf_numerical(x, kde_samples, kde_bw)
+        return _normal_cdf(x, center, sigma)
 
     # Tail: "X or less"
     if "or less" in low or "or lower" in low or "or below" in low:
         nums = re.findall(r"-?\d+", label)
         if nums:
             upper = int(nums[-1])
-            return _normal_cdf(upper + 0.5, center, sigma)
+            return _cdf(upper + 0.5)
         return 0.0
 
     # Tail: "X or more"
@@ -129,7 +203,7 @@ def _prob_for_outcome(
         nums = re.findall(r"-?\d+", label)
         if nums:
             lower = int(nums[0])
-            return 1.0 - _normal_cdf(lower - 0.5, center, sigma)
+            return 1.0 - _cdf(lower - 0.5)
         return 0.0
 
     # Range: "44-45"
@@ -137,13 +211,13 @@ def _prob_for_outcome(
     if range_match:
         lo_val = int(range_match.group(1))
         hi_val = int(range_match.group(2))
-        return _normal_cdf(hi_val + 0.5, center, sigma) - _normal_cdf(lo_val - 0.5, center, sigma)
+        return _cdf(hi_val + 0.5) - _cdf(lo_val - 0.5)
 
     # Single value: "8"
     single_match = re.search(r"(-?\d+)", label)
     if single_match:
         val = int(single_match.group(1))
-        return _normal_cdf(val + 0.5, center, sigma) - _normal_cdf(val - 0.5, center, sigma)
+        return _cdf(val + 0.5) - _cdf(val - 0.5)
 
     return 0.0
 
@@ -158,6 +232,8 @@ def _compute_hedging(
     sigma: float,
     budget: float = 10.0,
     min_model_prob: float = 0.03,
+    kde_samples: list[float] | None = None,
+    kde_bw: float | None = None,
 ) -> HedgingStrategy | None:
     """Compare model probabilities with live market prices.
 
@@ -173,7 +249,10 @@ def _compute_hedging(
 
     candidates: list[tuple[str, float, float, float]] = []
     for o in market.outcomes:
-        model_p = _prob_for_outcome(o.label, center, sigma)
+        model_p = _prob_for_outcome(
+            o.label, center, sigma,
+            kde_samples=kde_samples, kde_bw=kde_bw,
+        )
         if model_p >= min_model_prob:
             price = o.price if o.price > 0.005 else 0.0
             edge = model_p - price if price > 0 else 0.0
@@ -230,18 +309,23 @@ def analyze(
     providers: list[ProviderResult],
     market: TemperatureMarket | None = None,
     budget: float = 10.0,
+    max_picks: int = 4,
 ) -> BettingAnalysis:
     """Build a probability distribution over Polymarket temperature bins.
 
-    The distribution is modeled as Normal(center, sigma) where:
-      - center = aggregated tmax (bias-corrected, climate-anchored) + skewness nudge
-      - sigma  = blended provider ensemble spread & historical variability
+    The distribution uses Kernel Density Estimation (KDE) from provider
+    tmax values when enough data points are available (>= 5), falling
+    back to Normal(center, sigma) otherwise.
+
+    Sigma is computed from provider spread, historical variability, and
+    weather instability, with auto-calibration from self-learning data.
 
     Bins match Polymarket conventions:
       - US: 2°F bins aligned to even integers (42-43, 44-45, …)
       - Non-US: 1°C bins (7, 8, 9, …)
 
     If a live market is provided, computes a hedging strategy.
+    max_picks controls how many outcomes can be included in the allocation.
     """
     use_f = _is_us(country)
     unit = "°F" if use_f else "°C"
@@ -269,21 +353,40 @@ def analyze(
 
     sigma_c = max(sigma_c, 0.8)
 
+    # --- Apply instability factor (widens sigma in volatile weather) ---
+    inst_factor = getattr(agg, "instability_factor", 1.0)
+    sigma_c *= inst_factor
+
     # --- Convert to market unit ---
     if use_f:
         center = _c_to_f(center_c)
         sigma = sigma_c * 1.8
         step = 2
+        # Convert provider values to °F for KDE
+        kde_samples_raw = [_c_to_f(v) for v in tmax_c]
     else:
         center = center_c
         sigma = sigma_c
         step = 1
+        kde_samples_raw = list(tmax_c)
 
     skew = agg.skewness_tmax
     center += skew * sigma * 0.10
 
+    # --- KDE setup ---
+    kde_samples: list[float] | None = None
+    kde_bw: float | None = None
+    if len(kde_samples_raw) >= 5:
+        kde_samples = kde_samples_raw
+        kde_bw = _silverman_bandwidth(kde_samples_raw)
+        # Ensure bandwidth is reasonable
+        kde_bw = max(kde_bw, 0.3 if not use_f else 0.5)
+
     # --- Generate bins ---
-    bins = _bins_from_model(center, sigma, use_f, unit, step)
+    bins = _bins_from_model(
+        center, sigma, use_f, unit, step,
+        kde_samples=kde_samples, kde_bw=kde_bw,
+    )
 
     # Mark the best bin (highest probability)
     if bins:
@@ -293,7 +396,10 @@ def analyze(
     # --- Hedging strategy ---
     hedging = None
     if market is not None and market.outcomes:
-        hedging = _compute_hedging(market, center, sigma, budget)
+        hedging = _compute_hedging(
+            market, center, sigma, budget,
+            kde_samples=kde_samples, kde_bw=kde_bw,
+        )
 
     return BettingAnalysis(
         city=city,
@@ -306,6 +412,7 @@ def analyze(
         confidence=agg.confidence,
         budget=budget,
         hedging=hedging,
+        max_picks=max_picks,
     )
 
 
@@ -315,8 +422,17 @@ def _bins_from_model(
     use_f: bool,
     unit: str,
     step: int,
+    kde_samples: list[float] | None = None,
+    kde_bw: float | None = None,
 ) -> list[BettingBin]:
-    """Generate bins from our model."""
+    """Generate bins from our model (KDE or Normal)."""
+    use_kde = kde_samples is not None and kde_bw is not None and len(kde_samples) >= 5
+
+    def _cdf(x: float) -> float:
+        if use_kde:
+            return _kde_cdf_numerical(x, kde_samples, kde_bw)
+        return _normal_cdf(x, center, sigma)
+
     center_int = round(center)
     if use_f:
         base = (center_int // 2) * 2
@@ -331,10 +447,10 @@ def _bins_from_model(
     v = lo
     while v <= hi:
         if use_f:
-            p = _normal_cdf(v + 1.5, center, sigma) - _normal_cdf(v - 0.5, center, sigma)
+            p = _cdf(v + 1.5) - _cdf(v - 0.5)
             label = f"{v}-{v + 1}{unit}"
         else:
-            p = _normal_cdf(v + 0.5, center, sigma) - _normal_cdf(v - 0.5, center, sigma)
+            p = _cdf(v + 0.5) - _cdf(v - 0.5)
             label = f"{v}{unit}"
         raw_bins.append((v, label, p))
         v += step
@@ -356,7 +472,7 @@ def _bins_from_model(
     bins: list[BettingBin] = []
 
     lower_bound = raw_bins[first_sig][0]
-    p_low = _normal_cdf(lower_bound - 0.5, center, sigma)
+    p_low = _cdf(lower_bound - 0.5)
     bins.append(BettingBin(f"{lower_bound - 1}{unit} or less", p_low))
 
     for i in range(first_sig, last_sig + 1):
@@ -365,10 +481,10 @@ def _bins_from_model(
     last_v = raw_bins[last_sig][0]
     if use_f:
         upper_bound = last_v + 2
-        p_high = 1.0 - _normal_cdf(last_v + 1.5, center, sigma)
+        p_high = 1.0 - _cdf(last_v + 1.5)
     else:
         upper_bound = last_v + 1
-        p_high = 1.0 - _normal_cdf(last_v + 0.5, center, sigma)
+        p_high = 1.0 - _cdf(last_v + 0.5)
     bins.append(BettingBin(f"{upper_bound}{unit} or more", p_high))
 
     return bins
@@ -506,61 +622,76 @@ def format_analysis(analysis: BettingAnalysis) -> str:
         direction = "higher" if analysis.skewness > 0 else "lower"
         lines.append(f"  → Skew alert: some models lean {direction} than consensus")
 
-    # --- Allocation strategy ---
-    # Collect the top-2 tradeable outcomes by model probability
-    # Skip outcomes priced below 5¢ — too cheap to be meaningful
-    bankroll = analysis.budget
-    picks: list[tuple] = []  # (label, model_prob, market_price)
-    if h is not None and h.bets:
-        for cand in sorted_bins:
-            if len(picks) >= 2:
-                break
-            cand_bet = next((b for b in h.bets if b.label == cand.label), None)
-            if cand_bet and cand_bet.market_price >= 0.05:
-                picks.append((cand.label, cand.prob, cand_bet.market_price))
-
-    if len(picks) >= 2:
-        c1, c2 = picks[0][2], picks[1][2]
-        sum_prices = c1 + c2
-        combined_prob = picks[0][1] + picks[1][1]
-
-        lines.append("")
-        lines.append(f"  {'─' * W}")
-        lines.append(f"  ${bankroll:.0f} ALLOCATION")
-        lines.append(f"  {'─' * W}")
-
-        # Allocate proportionally to price → equalizes payout on both
-        # shares = bankroll / sum_prices (same for both outcomes)
-        shares = bankroll / sum_prices
-        profit_if_wins = shares - bankroll  # payout ($1/share) minus cost
-
-        lines.append("")
-        for label, p, c in picks:
-            alloc = bankroll * c / sum_prices
-            lines.append(
-                f"  {label:<10}  ${alloc:>5.2f}  →  "
-                f"{shares:.1f} shares @ {c * 100:.0f}¢"
-            )
-
-        lines.append("")
-        if sum_prices < 1.0:
-            roi_win = (profit_if_wins / bankroll) * 100
-            lines.append(f"  If either wins  →  ${shares:.2f}  "
-                         f"(+${profit_if_wins:.2f}, ROI {roi_win:+.0f}%)")
-        else:
-            lines.append(f"  If either wins  →  ${shares:.2f}  "
-                         f"(net {'+' if profit_if_wins >= 0 else ''}"
-                         f"${profit_if_wins:.2f})")
-        lines.append(f"  If neither wins →  -${bankroll:.2f}")
-
-        lines.append("")
-        ev_profit = combined_prob * shares - bankroll
-        ev_roi = (ev_profit / bankroll) * 100
-        lines.append(f"  Combined prob: {combined_prob * 100:.0f}%"
-                     f"  |  Expected: {'+' if ev_profit >= 0 else ''}"
-                     f"${ev_profit:.2f} (ROI {ev_roi:+.0f}%)")
+    # --- N-outcome allocation strategy ---
+    max_picks = getattr(analysis, "max_picks", 2)
+    _format_allocation(lines, analysis, sorted_bins, h, max_picks, W)
 
     lines.append(f"  {'=' * W}")
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _format_allocation(
+    lines: list[str],
+    analysis: BettingAnalysis,
+    sorted_bins: list[BettingBin],
+    h: HedgingStrategy | None,
+    max_picks: int,
+    W: int,
+) -> None:
+    """Format the N-outcome dutch-book allocation section."""
+    bankroll = analysis.budget
+    MIN_PRICE = 0.05
+
+    picks: list[tuple] = []  # (label, model_prob, market_price)
+    if h is not None and h.bets:
+        for cand in sorted_bins:
+            if len(picks) >= max_picks:
+                break
+            cand_bet = next((b for b in h.bets if b.label == cand.label), None)
+            if cand_bet and cand_bet.market_price >= MIN_PRICE:
+                picks.append((cand.label, cand.prob, cand_bet.market_price))
+
+    if len(picks) < 2:
+        return
+
+    sum_prices = sum(p[2] for p in picks)
+    combined_prob = sum(p[1] for p in picks)
+
+    lines.append("")
+    lines.append(f"  {'─' * W}")
+    lines.append(f"  ${bankroll:.0f} ALLOCATION ({len(picks)} outcomes)")
+    lines.append(f"  {'─' * W}")
+
+    # Dutch-book: allocate proportionally to price → equalizes payout
+    # shares = bankroll / sum_prices (same for all outcomes)
+    shares = bankroll / sum_prices
+    profit_if_wins = shares - bankroll  # payout ($1/share) minus cost
+
+    lines.append("")
+    for label, p, c in picks:
+        alloc = bankroll * c / sum_prices
+        lines.append(
+            f"  {label:<12}  ${alloc:>5.2f}  →  "
+            f"{shares:.1f} shares @ {c * 100:.0f}¢"
+            f"  (model: {p * 100:.0f}%)"
+        )
+
+    lines.append("")
+    if sum_prices < 1.0:
+        roi_win = (profit_if_wins / bankroll) * 100
+        lines.append(f"  If any wins   →  ${shares:.2f}  "
+                     f"(+${profit_if_wins:.2f}, ROI {roi_win:+.0f}%)")
+    else:
+        lines.append(f"  If any wins   →  ${shares:.2f}  "
+                     f"(net {'+' if profit_if_wins >= 0 else ''}"
+                     f"${profit_if_wins:.2f})")
+    lines.append(f"  If none wins  →  -${bankroll:.2f}")
+
+    lines.append("")
+    ev_profit = combined_prob * shares - bankroll
+    ev_roi = (ev_profit / bankroll) * 100
+    lines.append(f"  Combined prob: {combined_prob * 100:.0f}%"
+                 f"  |  Expected: {'+' if ev_profit >= 0 else ''}"
+                 f"${ev_profit:.2f} (ROI {ev_roi:+.0f}%)")

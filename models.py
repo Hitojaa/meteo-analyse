@@ -9,12 +9,14 @@ from enum import Enum
 class DataQuality(str, Enum):
     DAILY_DIRECT = "daily_direct"
     COMPUTED_FROM_HOURLY = "computed_from_hourly"
+    HOURLY_PEAK = "hourly_peak"
 
     @property
     def weight(self) -> float:
         return {
             DataQuality.DAILY_DIRECT: 1.0,
             DataQuality.COMPUTED_FROM_HOURLY: 0.9,
+            DataQuality.HOURLY_PEAK: 1.15,
         }[self]
 
 
@@ -36,6 +38,7 @@ class ProviderResult:
     date: str  # YYYY-MM-DD
     timezone: str
     quality: DataQuality = DataQuality.DAILY_DIRECT
+    instability: dict | None = None  # weather instability indicators
 
 
 @dataclass
@@ -60,6 +63,7 @@ class AggregatedResult:
     hist_tmin_std: float | None = None
     hist_tmax_std: float | None = None
     hist_sample_size: int | None = None
+    instability_factor: float = 1.0  # weather instability multiplier for sigma
 
 
 @dataclass

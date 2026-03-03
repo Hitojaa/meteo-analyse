@@ -36,13 +36,14 @@ from polymarket_api import (
     search_all_temperature_markets,
     parse_market_title,
 )
-from providers import open_meteo, openweather, weatherapi
+from providers import open_meteo, openweather, pirateweather, weatherapi
 from verification import ProviderAccuracy, save_forecast, verify_and_update
 
 # Providers that return a single ProviderResult
 SINGLE_PROVIDERS = [
     ("WeatherAPI", weatherapi.fetch),
     ("OpenWeatherMap", openweather.fetch),
+    ("Pirate Weather (NBM)", pirateweather.fetch),
 ]
 
 logging.basicConfig(
@@ -296,6 +297,7 @@ def _run_polymarket_analysis(
     agg: AggregatedResult,
     providers: list[ProviderResult],
     budget: float = 10.0,
+    max_picks: int = 4,
 ) -> tuple | None:
     """Print model-based betting analysis with optional live hedging strategy.
 
@@ -352,22 +354,23 @@ def _run_polymarket_analysis(
         providers=providers,
         market=market,
         budget=budget,
+        max_picks=max_picks,
     )
     # Propagate price source to hedging strategy
     if betting.hedging is not None:
         betting.hedging.price_source = price_source
     print(polymarket_format(betting))
 
-    # Build picks for --buy: extract the top-2 tradeable outcomes
-    picks = _extract_buy_picks(betting, market, budget)
+    # Build picks for --buy: extract top N tradeable outcomes
+    picks = _extract_buy_picks(betting, market, budget, max_picks=max_picks)
     return market, betting, picks
 
 
-def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
-    """Extract the top-2 tradeable picks from a BettingAnalysis.
+def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 4) -> list[dict]:
+    """Extract top N tradeable picks from a BettingAnalysis.
 
     Returns a list of dicts: [{label, token_id, price, size, alloc}, ...]
-    matching the ALLOCATION logic in polymarket.format_analysis.
+    matching the N-outcome ALLOCATION logic in polymarket.format_analysis.
     """
     h = betting.hedging
     if h is None or not h.bets or market is None:
@@ -376,11 +379,11 @@ def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
     bankroll = budget
 
-    # Collect top-2 tradeable outcomes by model probability
+    # Collect top N tradeable outcomes by model probability
     # Skip outcomes priced below 5¢ — too cheap to be meaningful
     raw_picks = []
     for cand in sorted_bins:
-        if len(raw_picks) >= 2:
+        if len(raw_picks) >= max_picks:
             break
         cand_bet = next((b for b in h.bets if b.label == cand.label), None)
         if cand_bet and cand_bet.market_price >= 0.05:
@@ -389,8 +392,7 @@ def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     if len(raw_picks) < 2:
         return []
 
-    c1, c2 = raw_picks[0][2], raw_picks[1][2]
-    sum_prices = c1 + c2
+    sum_prices = sum(p[2] for p in raw_picks)
     shares = bankroll / sum_prices
 
     picks = []
@@ -413,11 +415,11 @@ def _extract_buy_picks(betting, market, budget: float = 10.0) -> list[dict]:
     return picks
 
 
-def _auto_scan(budget: float = 10.0) -> None:
+def _auto_scan(budget: float = 10.0, max_picks: int = 4) -> None:
     """Scan all active Polymarket temperature markets and rank by ROI.
 
     For each market: geocode city → fetch forecast → analyze → compute ROI.
-    Displays the top 3 markets with the 2 best trades each.
+    Displays the top 3 markets with the N best trades each.
     """
     import time
     from datetime import timedelta
@@ -520,12 +522,13 @@ def _auto_scan(budget: float = 10.0) -> None:
                 providers=results,
                 market=market,
                 budget=budget,
+                max_picks=max_picks,
             )
         except Exception as exc:
             print(f"analysis failed ({exc})")
             continue
 
-        # Extract top-2 tradeable picks with ROI
+        # Extract top N tradeable picks with ROI
         h = betting.hedging
         if not h or not h.bets:
             print("no tradeable outcomes")
@@ -538,7 +541,7 @@ def _auto_scan(budget: float = 10.0) -> None:
         sorted_bins = sorted(betting.bins, key=lambda b: b.prob, reverse=True)
         raw_picks = []
         for cand in sorted_bins:
-            if len(raw_picks) >= 2:
+            if len(raw_picks) >= max_picks:
                 break
             cand_bet = next((b for b in h.bets if b.label == cand.label), None)
             if cand_bet and cand_bet.market_price >= MIN_PRICE:
@@ -548,9 +551,8 @@ def _auto_scan(budget: float = 10.0) -> None:
             print("not enough tradeable outcomes")
             continue
 
-        c1, c2 = raw_picks[0][2], raw_picks[1][2]
-        sum_prices = c1 + c2
-        combined_prob = raw_picks[0][1] + raw_picks[1][1]
+        sum_prices = sum(p[2] for p in raw_picks)
+        combined_prob = sum(p[1] for p in raw_picks)
         shares = budget / sum_prices
         ev_profit = combined_prob * shares - budget
         roi_pct = (ev_profit / budget) * 100
@@ -616,10 +618,11 @@ def _auto_scan(budget: float = 10.0) -> None:
 
         print()
         print(f"       Combined prob: {r.combined_prob*100:.0f}%"
-              f"  |  ROI: {r.roi_pct:+.0f}%")
+              f"  |  ROI: {r.roi_pct:+.0f}%"
+              f"  |  {len(r.picks)} outcomes")
         profit = r.combined_prob * shares - budget
-        print(f"       If either wins → ${shares:.2f} (+${profit:.2f})")
-        print(f"       If neither     → -${budget:.0f}")
+        print(f"       If any wins  → ${shares:.2f} (+${profit:.2f})")
+        print(f"       If none wins → -${budget:.0f}")
 
     print(f"\n{'=' * W}\n")
 
@@ -672,6 +675,13 @@ def main(argv: list[str] | None = None) -> None:
         help="After analysis, prompt to place orders on Polymarket",
     )
     parser.add_argument(
+        "--max-picks",
+        type=int,
+        default=4,
+        dest="max_picks",
+        help="Max outcomes to include in dutch-book allocation (default: 4)",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         dest="auto_scan",
@@ -681,7 +691,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Auto scan mode ---
     if args.auto_scan:
-        _auto_scan(budget=args.budget)
+        _auto_scan(budget=args.budget, max_picks=args.max_picks)
         return
 
     if not args.city:
@@ -710,7 +720,7 @@ def main(argv: list[str] | None = None) -> None:
             picks = []
             if not args.no_polymarket:
                 try:
-                    result = _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider, budget=args.budget)
+                    result = _run_polymarket_analysis(loc, date, report.aggregated, report.per_provider, budget=args.budget, max_picks=args.max_picks)
                     if result:
                         _, _, picks = result
                 except Exception as exc:
@@ -778,7 +788,7 @@ def main(argv: list[str] | None = None) -> None:
         picks = []
         if not args.no_polymarket:
             try:
-                result = _run_polymarket_analysis(loc, date, report.aggregated, results, budget=args.budget)
+                result = _run_polymarket_analysis(loc, date, report.aggregated, results, budget=args.budget, max_picks=args.max_picks)
                 if result:
                     _, _, picks = result
             except Exception as exc:

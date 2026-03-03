@@ -12,8 +12,12 @@ from polymarket import (
     HedgingStrategy,
     _compute_hedging,
     _is_us,
+    _kde_cdf_numerical,
+    _kde_pdf,
     _normal_cdf,
+    _normal_pdf,
     _prob_for_outcome,
+    _silverman_bandwidth,
     analyze,
     format_analysis,
 )
@@ -442,3 +446,119 @@ class TestAnalyzeWithMarket:
         assert "RECOMMENDATION" in output
         assert "Model" in output
         assert "Price" in output
+
+
+# ===========================================================================
+# KDE tests
+# ===========================================================================
+
+class TestKDE:
+    def test_kde_pdf_peaks_at_sample(self):
+        samples = [10.0]
+        bw = 1.0
+        # PDF should peak at the sample value
+        assert _kde_pdf(10.0, samples, bw) > _kde_pdf(12.0, samples, bw)
+
+    def test_kde_pdf_multimodal(self):
+        # Two clusters: should have peaks near both
+        samples = [5.0, 5.1, 5.0, 15.0, 14.9, 15.1]
+        bw = 0.5
+        p_5 = _kde_pdf(5.0, samples, bw)
+        p_15 = _kde_pdf(15.0, samples, bw)
+        p_10 = _kde_pdf(10.0, samples, bw)
+        assert p_5 > p_10
+        assert p_15 > p_10
+
+    def test_kde_cdf_bounds(self):
+        samples = [10.0, 11.0, 12.0, 10.5, 11.5]
+        bw = _silverman_bandwidth(samples)
+        # CDF at very low should be ~0
+        assert _kde_cdf_numerical(-100.0, samples, bw) < 0.01
+        # CDF at very high should be ~1
+        assert _kde_cdf_numerical(100.0, samples, bw) > 0.99
+
+    def test_kde_cdf_monotonic(self):
+        samples = [8.0, 9.0, 10.0, 11.0, 12.0]
+        bw = _silverman_bandwidth(samples)
+        prev = 0.0
+        for x in range(5, 16):
+            c = _kde_cdf_numerical(float(x), samples, bw)
+            assert c >= prev
+            prev = c
+
+    def test_silverman_bandwidth_reasonable(self):
+        samples = [10.0 + i * 0.5 for i in range(10)]
+        bw = _silverman_bandwidth(samples)
+        assert 0.1 < bw < 5.0
+
+    def test_prob_for_outcome_with_kde(self):
+        samples = [10.0, 10.5, 11.0, 10.2, 10.8]
+        bw = _silverman_bandwidth(samples)
+        # Probability near center should be higher than at edges
+        p_center = _prob_for_outcome("10°C", 10.5, 1.0, kde_samples=samples, kde_bw=bw)
+        p_edge = _prob_for_outcome("14°C", 10.5, 1.0, kde_samples=samples, kde_bw=bw)
+        assert p_center > p_edge
+
+    def test_kde_probs_sum_approx_one(self):
+        """KDE-based bins should approximately sum to 1."""
+        providers = [_make_provider(10.0 + i * 0.3) for i in range(10)]
+        agg = _make_agg(11.0)
+        result = analyze("Paris", "2026-02-17", "France", agg, providers)
+        total = sum(b.prob for b in result.bins)
+        assert abs(total - 1.0) < 0.05  # KDE integration may have small error
+
+
+# ===========================================================================
+# N-outcome allocation tests
+# ===========================================================================
+
+class TestNOutcomeAllocation:
+    def test_max_picks_4_produces_up_to_4_outcomes(self):
+        providers = [_make_provider(10.0 + i * 0.3) for i in range(8)]
+        agg = _make_agg(10.5)
+        market = _make_market([
+            ("8°C or less", 0.05),
+            ("9°C", 0.10),
+            ("10°C", 0.25),
+            ("11°C", 0.25),
+            ("12°C", 0.10),
+            ("13°C or more", 0.05),
+        ])
+        result = analyze("Paris", "2026-02-17", "France", agg, providers,
+                        market=market, max_picks=4)
+        output = format_analysis(result)
+        assert "ALLOCATION" in output
+        # Should show "4 outcomes" or "3 outcomes"
+        assert "outcomes" in output
+
+    def test_max_picks_2_backwards_compatible(self):
+        providers = [_make_provider(10.0 + i * 0.3) for i in range(5)]
+        agg = _make_agg(10.5)
+        market = _make_market([
+            ("9°C", 0.10),
+            ("10°C", 0.25),
+            ("11°C", 0.25),
+            ("12°C or more", 0.05),
+        ])
+        result = analyze("Paris", "2026-02-17", "France", agg, providers,
+                        market=market, max_picks=2)
+        output = format_analysis(result)
+        assert "2 outcomes" in output
+
+
+# ===========================================================================
+# Instability factor tests
+# ===========================================================================
+
+class TestInstabilityFactor:
+    def test_instability_widens_sigma(self):
+        """Higher instability factor should produce wider distribution."""
+        providers = [_make_provider(10.0) for _ in range(5)]
+        agg_calm = _make_agg(10.0)
+        agg_calm.instability_factor = 1.0
+        agg_stormy = _make_agg(10.0)
+        agg_stormy.instability_factor = 1.25
+
+        result_calm = analyze("A", "2026-02-17", "France", agg_calm, providers)
+        result_stormy = analyze("A", "2026-02-17", "France", agg_stormy, providers)
+        assert result_stormy.sigma > result_calm.sigma

@@ -134,9 +134,11 @@ def fetch_historical(
 
     # Filter for the target day-of-year ± window
     target_doy = target.timetuple().tm_yday
+    current_year = target.year
 
     filtered_tmins: list[float] = []
     filtered_tmaxs: list[float] = []
+    filtered_weights: list[float] = []
     years_seen: set[int] = set()
 
     for i, date_str in enumerate(times):
@@ -155,15 +157,40 @@ def fetch_historical(
                 filtered_tmaxs.append(tmax_val)
                 years_seen.add(d.year)
 
+                # Exponential recency weight: recent years count more
+                # year_gap=0 → weight=1.0, gap=1 → 0.85, gap=2 → 0.72
+                year_gap = max(0, current_year - d.year)
+                filtered_weights.append(0.85 ** year_gap)
+
     if len(filtered_tmins) < 5:
         log.info("Insufficient historical data: %d samples", len(filtered_tmins))
         return None
 
+    # Weighted mean and std — recent years weighted more heavily
+    total_w = sum(filtered_weights)
+    w_tmin_mean = sum(v * w for v, w in zip(filtered_tmins, filtered_weights)) / total_w
+    w_tmax_mean = sum(v * w for v, w in zip(filtered_tmaxs, filtered_weights)) / total_w
+
+    if len(filtered_tmins) > 1:
+        w_tmin_var = sum(
+            w * (v - w_tmin_mean) ** 2
+            for v, w in zip(filtered_tmins, filtered_weights)
+        ) / total_w
+        w_tmax_var = sum(
+            w * (v - w_tmax_mean) ** 2
+            for v, w in zip(filtered_tmaxs, filtered_weights)
+        ) / total_w
+        w_tmin_std = w_tmin_var ** 0.5
+        w_tmax_std = w_tmax_var ** 0.5
+    else:
+        w_tmin_std = 0.0
+        w_tmax_std = 0.0
+
     stats = HistoricalStats(
-        tmin_mean=round(mean(filtered_tmins), 1),
-        tmin_std=round(stdev(filtered_tmins), 1) if len(filtered_tmins) > 1 else 0.0,
-        tmax_mean=round(mean(filtered_tmaxs), 1),
-        tmax_std=round(stdev(filtered_tmaxs), 1) if len(filtered_tmaxs) > 1 else 0.0,
+        tmin_mean=round(w_tmin_mean, 1),
+        tmin_std=round(w_tmin_std, 1),
+        tmax_mean=round(w_tmax_mean, 1),
+        tmax_std=round(w_tmax_std, 1),
         sample_size=len(filtered_tmins),
         years_covered=len(years_seen),
     )
