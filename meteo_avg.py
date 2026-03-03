@@ -18,6 +18,13 @@ from typing import Any
 
 from zoneinfo import ZoneInfo
 
+# Load .env file for API keys (WeatherAPI, OpenWeather, Pirate Weather, Polymarket)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import cache
 from aggregate import aggregate
 from geocode import geocode
