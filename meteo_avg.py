@@ -501,10 +501,11 @@ def _auto_scan(budget: float = 10.0, max_picks: int = 3, target_date: str | None
         if target_date and date != target_date:
             continue
 
-        # Skip markets too far in the future for reliable forecasts
+        # Skip markets too far in the future or already past
         try:
-            market_date = datetime.fromisoformat(date)
-            days_ahead = (market_date - datetime.now()).days
+            market_date = datetime.fromisoformat(date).date()
+            today = datetime.now().date()
+            days_ahead = (market_date - today).days
             if days_ahead > 16:
                 continue
             if days_ahead < 0:
