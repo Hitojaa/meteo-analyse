@@ -714,11 +714,11 @@ def main(argv: list[str] | None = None) -> None:
         help="After analysis, prompt to place orders on Polymarket",
     )
     parser.add_argument(
-        "--max-picks",
+        "--trades", "--max-picks",
         type=int,
         default=3,
         dest="max_picks",
-        help="Max outcomes to include in dutch-book allocation (default: 3)",
+        help="Max outcomes/trades per market (default: 3)",
     )
     parser.add_argument(
         "--auto",
