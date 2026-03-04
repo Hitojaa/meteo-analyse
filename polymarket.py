@@ -78,7 +78,7 @@ class BettingAnalysis:
     confidence: float
     budget: float = 10.0
     hedging: HedgingStrategy | None = None
-    max_picks: int = 2  # max outcomes in allocation
+    max_picks: int = 3  # max outcomes in allocation
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +309,7 @@ def analyze(
     providers: list[ProviderResult],
     market: TemperatureMarket | None = None,
     budget: float = 10.0,
-    max_picks: int = 4,
+    max_picks: int = 3,
 ) -> BettingAnalysis:
     """Build a probability distribution over Polymarket temperature bins.
 
@@ -655,6 +655,15 @@ def _format_allocation(
 
     if len(picks) < 2:
         return
+
+    # Smart reduction: if top 2 picks already have strong combined
+    # probability (>=55%) and positive expected edge, only keep 2 trades
+    # to concentrate the bankroll on the best opportunities.
+    if len(picks) > 2:
+        top2_prob = picks[0][1] + picks[1][1]
+        top2_prices = picks[0][2] + picks[1][2]
+        if top2_prob >= 0.55 and top2_prob > top2_prices:
+            picks = picks[:2]
 
     sum_prices = sum(p[2] for p in picks)
     combined_prob = sum(p[1] for p in picks)

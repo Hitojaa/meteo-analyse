@@ -513,7 +513,7 @@ class TestKDE:
 # ===========================================================================
 
 class TestNOutcomeAllocation:
-    def test_max_picks_4_produces_up_to_4_outcomes(self):
+    def test_max_picks_3_produces_up_to_3_outcomes(self):
         providers = [_make_provider(10.0 + i * 0.3) for i in range(8)]
         agg = _make_agg(10.5)
         market = _make_market([
@@ -525,11 +525,27 @@ class TestNOutcomeAllocation:
             ("13°C or more", 0.05),
         ])
         result = analyze("Paris", "2026-02-17", "France", agg, providers,
-                        market=market, max_picks=4)
+                        market=market, max_picks=3)
         output = format_analysis(result)
         assert "ALLOCATION" in output
-        # Should show "4 outcomes" or "3 outcomes"
         assert "outcomes" in output
+
+    def test_smart_reduction_to_2_when_high_prob(self):
+        """When top 2 picks have >=55% combined prob and positive edge, reduce to 2."""
+        providers = [_make_provider(10.0 + i * 0.3) for i in range(8)]
+        agg = _make_agg(10.5)
+        # Top 2 bins (10°C, 11°C) have high model prob and prices below model
+        market = _make_market([
+            ("9°C", 0.08),
+            ("10°C", 0.15),
+            ("11°C", 0.15),
+            ("12°C", 0.08),
+        ])
+        result = analyze("Paris", "2026-02-17", "France", agg, providers,
+                        market=market, max_picks=3)
+        output = format_analysis(result)
+        assert "ALLOCATION" in output
+        assert "2 outcomes" in output
 
     def test_max_picks_2_backwards_compatible(self):
         providers = [_make_provider(10.0 + i * 0.3) for i in range(5)]

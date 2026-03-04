@@ -304,7 +304,7 @@ def _run_polymarket_analysis(
     agg: AggregatedResult,
     providers: list[ProviderResult],
     budget: float = 10.0,
-    max_picks: int = 4,
+    max_picks: int = 3,
 ) -> tuple | None:
     """Print model-based betting analysis with optional live hedging strategy.
 
@@ -373,7 +373,7 @@ def _run_polymarket_analysis(
     return market, betting, picks
 
 
-def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 4) -> list[dict]:
+def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 3) -> list[dict]:
     """Extract top N tradeable picks from a BettingAnalysis.
 
     Returns a list of dicts: [{label, token_id, price, size, alloc}, ...]
@@ -399,6 +399,14 @@ def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 4
     if len(raw_picks) < 2:
         return []
 
+    # Smart reduction: concentrate on 2 trades when top 2 have strong
+    # combined probability (>=55%) and positive expected edge.
+    if len(raw_picks) > 2:
+        top2_prob = raw_picks[0][1] + raw_picks[1][1]
+        top2_prices = raw_picks[0][2] + raw_picks[1][2]
+        if top2_prob >= 0.55 and top2_prob > top2_prices:
+            raw_picks = raw_picks[:2]
+
     sum_prices = sum(p[2] for p in raw_picks)
     shares = bankroll / sum_prices
 
@@ -422,7 +430,7 @@ def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 4
     return picks
 
 
-def _auto_scan(budget: float = 10.0, max_picks: int = 4) -> None:
+def _auto_scan(budget: float = 10.0, max_picks: int = 3) -> None:
     """Scan all active Polymarket temperature markets and rank by ROI.
 
     For each market: geocode city → fetch forecast → analyze → compute ROI.
@@ -684,9 +692,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--max-picks",
         type=int,
-        default=4,
+        default=3,
         dest="max_picks",
-        help="Max outcomes to include in dutch-book allocation (default: 4)",
+        help="Max outcomes to include in dutch-book allocation (default: 3)",
     )
     parser.add_argument(
         "--auto",
