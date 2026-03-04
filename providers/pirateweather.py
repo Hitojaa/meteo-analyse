@@ -42,8 +42,8 @@ def fetch(lat: float, lon: float, date: str, tz: str) -> ProviderResult:
             "PIRATEWEATHER_KEY environment variable not set – skipping Pirate Weather"
         )
 
-    target = datetime.fromisoformat(date)
-    now = datetime.now()
+    target = datetime.fromisoformat(date).date()
+    now = datetime.now().date()
     days_ahead = (target - now).days
 
     if days_ahead >= 0 and days_ahead <= 7:
