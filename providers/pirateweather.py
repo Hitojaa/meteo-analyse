@@ -37,7 +37,7 @@ def fetch(lat: float, lon: float, date: str, tz: str) -> ProviderResult:
         RuntimeError: If PIRATEWEATHER_KEY is not set or no data returned.
     """
     api_key = os.environ.get("PIRATEWEATHER_KEY")
-    if not api_key:
+    if not api_key or api_key == "your_key_here":
         raise RuntimeError(
             "PIRATEWEATHER_KEY environment variable not set – skipping Pirate Weather"
         )

@@ -31,7 +31,7 @@ def fetch(lat: float, lon: float, date: str, timezone: str) -> ProviderResult:
         RuntimeError: If OPENWEATHER_KEY is not set or no data for the date.
     """
     api_key = os.environ.get("OPENWEATHER_KEY")
-    if not api_key:
+    if not api_key or api_key == "your_key_here":
         raise RuntimeError("OPENWEATHER_KEY environment variable not set – skipping OpenWeatherMap")
 
     params = {

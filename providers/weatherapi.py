@@ -23,7 +23,7 @@ def fetch(lat: float, lon: float, date: str, timezone: str) -> ProviderResult:
         RuntimeError: If WEATHERAPI_KEY is not set.
     """
     api_key = os.environ.get("WEATHERAPI_KEY")
-    if not api_key:
+    if not api_key or api_key == "your_key_here":
         raise RuntimeError("WEATHERAPI_KEY environment variable not set – skipping WeatherAPI")
 
     params = {
