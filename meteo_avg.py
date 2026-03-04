@@ -430,11 +430,14 @@ def _extract_buy_picks(betting, market, budget: float = 10.0, max_picks: int = 3
     return picks
 
 
-def _auto_scan(budget: float = 10.0, max_picks: int = 3) -> None:
+def _auto_scan(budget: float = 10.0, max_picks: int = 3, target_date: str | None = None) -> None:
     """Scan all active Polymarket temperature markets and rank by ROI.
 
     For each market: geocode city → fetch forecast → analyze → compute ROI.
     Displays the top 3 markets with the N best trades each.
+
+    If *target_date* is given (YYYY-MM-DD), only markets matching that date
+    are analysed.
     """
     import time
     from datetime import timedelta
@@ -443,7 +446,10 @@ def _auto_scan(budget: float = 10.0, max_picks: int = 3) -> None:
     logging.getLogger().setLevel(logging.CRITICAL)
 
     print(f"\n{'=' * 72}")
-    print("  AUTO SCAN — Searching all Polymarket temperature markets...")
+    if target_date:
+        print(f"  AUTO SCAN — Polymarket temperature markets for {target_date}")
+    else:
+        print("  AUTO SCAN — Searching all Polymarket temperature markets...")
     print(f"{'=' * 72}\n")
 
     markets = search_all_temperature_markets()
@@ -477,6 +483,10 @@ def _auto_scan(budget: float = 10.0, max_picks: int = 3) -> None:
             continue
 
         city, date = parsed
+
+        # If user specified a date, only scan markets for that date
+        if target_date and date != target_date:
+            continue
 
         # Skip markets too far in the future for reliable forecasts
         try:
@@ -706,7 +716,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Auto scan mode ---
     if args.auto_scan:
-        _auto_scan(budget=args.budget, max_picks=args.max_picks)
+        _auto_scan(budget=args.budget, max_picks=args.max_picks, target_date=args.date)
         return
 
     if not args.city:
