@@ -476,6 +476,19 @@ def _auto_scan(budget: float = 10.0, max_picks: int = 3, target_date: str | None
 
     scan_results: list[ScanResult] = []
 
+    # First pass: collect all available dates so we can inform the user
+    available_dates: set[str] = set()
+    for market in markets:
+        parsed = parse_market_title(market.title)
+        if parsed:
+            available_dates.add(parsed[1])
+
+    if target_date and target_date not in available_dates:
+        sorted_dates = sorted(available_dates)
+        print(f"  No markets found for {target_date}.")
+        print(f"  Available dates: {', '.join(sorted_dates)}")
+        return
+
     for i, market in enumerate(markets):
         parsed = parse_market_title(market.title)
         if not parsed:
